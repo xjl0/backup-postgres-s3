@@ -12,13 +12,13 @@ services:
       PGPORT: "5432"
       PGUSER: "postgres"                       # нужен CONNECT ко всем БД + чтение (проще суперюзер)
       PGPASSWORD: "CHANGE_ME"
-      # S3
+      # S3 (rclone): подключение задаётся переменными окружения
+      S3_ENDPOINT: "https://s3.kz-1.srvstorage.kz"
+      S3_REGION: "kz-1"
+      S3_ACCESS_KEY_ID: "CHANGE_ME"
+      S3_SECRET_ACCESS_KEY: "CHANGE_ME"
       S3_BUCKET: "CHANGE_ME"
-      S3_PREFIX: "myapp"                       # префикс в бакете
-      S3_ENDPOINT: ""                          # пусто = AWS; иначе, напр. https://s3.kz-1.srvstorage.kz
-      AWS_ACCESS_KEY_ID: "CHANGE_ME"
-      AWS_SECRET_ACCESS_KEY: "CHANGE_ME"
-      AWS_DEFAULT_REGION: "us-east-1"          # для S3-совместимых — регион провайдера, напр. kz-1
+      S3_PREFIX: "myapp"
       # Поведение
       KEEP: "7"                                # копий каждой базы
       ZSTD_LEVEL: "9"                          # 6=быстро, 9=баланс, 19=плотнее/медленнее
@@ -26,7 +26,7 @@ services:
       EXCLUDE_DBS: "postgres"
       # Проверки целостности
       VERIFY: "1"                              # zstd -t + pg_restore -l перед загрузкой
-      VERIFY_FULL: "0"                         # 1 = ещё и полное чтение архива (без БД), медленнее
+      VERIFY_FULL: "1"                         # 1 = ещё и полное чтение архива (без БД), медленнее
       VERIFY_REMOTE: "1"                       # сверка размера в S3 после загрузки
       RESTORE_TEST: "0"                        # 1 = тест восстановления в скретч-БД (нужен CREATEDB)
     # Альтернатива environment: — файл KEY=VALUE (окружение приоритетнее файла).

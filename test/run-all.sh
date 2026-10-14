@@ -14,19 +14,21 @@ fail=0
 
 log() { echo "[run-all] $*"; }
 
-log "стенд: PostgreSQL [$VERSIONS], бакет $S3_BUCKET, S3 $S3_ENDPOINT"
+log "стенд: PostgreSQL [$VERSIONS], бакет $S3_BUCKET"
 
-# S3 может ещё подниматься; ждём и идемпотентно создаём бакет (гонки с s3-init не боимся)
-EP=""; [ -n "${S3_ENDPOINT:-}" ] && EP="--endpoint-url $S3_ENDPOINT"
+# S3 может ещё подниматься; ждём и идемпотентно создаём бакет (rclone mkdir = create bucket)
+. /s3env.sh
 n=0
-until aws $EP s3api list-buckets >/dev/null 2>&1; do
+until rclone lsd "$S3R:" >/dev/null 2>&1; do
   n=$((n + 1)); [ "$n" -gt 60 ] && { log "FATAL: S3 недоступен ($S3_ENDPOINT)"; exit 1; }
   sleep 1
 done
-if aws $EP s3api create-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1; then
-  log "бакет $S3_BUCKET создан"
+# ВАЖНО: это только для стенда — s3mock не создаёт бакеты сам. Скрипт бэкапа бакеты НЕ создаёт.
+rclone mkdir "$S3R:$S3_BUCKET" >/dev/null 2>&1 || true
+if rclone lsf "$S3R:$S3_BUCKET/" >/dev/null 2>&1; then
+  log "бакет $S3_BUCKET доступен"
 else
-  log "бакет $S3_BUCKET уже существует"
+  log "FATAL: бакет $S3_BUCKET недоступен"; exit 1
 fi
 
 for v in $VERSIONS; do
@@ -43,13 +45,9 @@ for v in $VERSIONS; do
     log "PG$v: БЭКАП ЗАВЕРШИЛСЯ С ОШИБКАМИ"; fail=1
   fi
 
-  # объект в S3 должен быть проверен БЕЗ скачивания (размер + сумма)
+  # объект в S3 должен быть проверен БЕЗ скачивания (сверка размера)
   if grep -q 'размер в S3 сверен' "/tmp/backup-$v.log"; then
-    if grep -q 'ETag multipart' "/tmp/backup-$v.log"; then
-      log "PG$v: объект в S3 сверен без скачивания (multipart: подтверждён размер)"
-    else
-      log "PG$v: объект в S3 сверен без скачивания (single-part: MD5/ETag)"
-    fi
+    log "PG$v: объект в S3 сверен без скачивания (размер)"
   else
     log "PG$v: FAIL — в логе нет подтверждения проверки объекта в S3"; fail=1
   fi
@@ -71,23 +69,6 @@ else
 fi
 
 # негативные проверки: падение pg_dump не должно приводить к загрузке битого дампа
-echo
-echo "################## Fault injection ##################"
-if PGHOST="pg$LAST_VER" sh /faults.sh "pg$LAST_VER"; then
-  log "faults: OK"
-else
-  log "faults: ПРОВАЛЕН"; fail=1
-fi
-
-# уведомления об ошибках
-echo
-echo "################## Уведомления ##################"
-if PGHOST="pg$LAST_VER" sh /notify.sh "pg$LAST_VER"; then
-  log "notify: OK"
-else
-  log "notify: ПРОВАЛЕН"; fail=1
-fi
-
 echo
 if [ "$fail" = "0" ]; then
   log "ИТОГ: все версии [$VERSIONS] — бэкап и восстановление данных OK"

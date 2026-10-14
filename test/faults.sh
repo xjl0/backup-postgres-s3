@@ -5,7 +5,7 @@
 # оборванный дамп с валидным оглавлением может пройти verify и уехать в S3 как «успешный»).
 #
 # Использование: faults.sh [pgXX=pg18]
-# Переменные: PGHOST/PGPORT/PGUSER/PGPASSWORD, S3_BUCKET/S3_ENDPOINT, AWS_*.
+# Переменные: PGHOST/PGPORT/PGUSER/PGPASSWORD, S3_BUCKET/S3_PREFIX (rclone).
 set -u
 
 VER="${1:-pg18}"
@@ -14,8 +14,7 @@ VER="${1:-pg18}"
 : "${S3_BUCKET:?нужен S3_BUCKET}"
 export PGPASSWORD
 PGPORT="${PGPORT:-5432}"
-EP=""; [ -n "${S3_ENDPOINT:-}" ] && EP="--endpoint-url $S3_ENDPOINT"
-aws configure set default.s3.addressing_style path >/dev/null 2>&1 || true
+. /s3env.sh
 
 DB="app"
 PREFIX="test/faults-$VER"
@@ -25,18 +24,8 @@ FAILED=0
 log() { echo "[faults $VER] $*"; }
 
 psqlD() { psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$1" -At -c "$2"; }
-count_prefix() {
-  aws $EP s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$PREFIX/" \
-    --query 'sort_by(Contents,&Key)[].Key' --output text 2>/dev/null \
-    | tr '\t' '\n' | grep . | grep -v '^None$' | grep -c . || true
-}
-clean_prefix() {
-  aws $EP s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$PREFIX/" \
-    --query 'sort_by(Contents,&Key)[].Key' --output text 2>/dev/null \
-    | tr '\t' '\n' | grep . | grep -v '^None$' | while IFS= read -r k; do
-        aws $EP --only-show-errors s3 rm "s3://$S3_BUCKET/$k" >/dev/null 2>&1 || true
-      done
-}
+count_prefix() { s3_list "$PREFIX/" | grep -c . || true; }
+clean_prefix() { for k in $(s3_list "$PREFIX/"); do s3_del "$PREFIX/$k"; done; }
 
 # --- эталонный (валидный) дамп: нужен, чтобы имитировать «оборвалось на середине» ---
 createdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" faults_ref 2>/dev/null || true

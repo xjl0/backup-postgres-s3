@@ -5,7 +5,7 @@
 Подключается к любому стеку одной ссылкой на образ + переменными окружения.
 
 ```
-Dockerfile                      # postgres-клиент + aws-cli + zstd + скрипт
+Dockerfile                      # postgres-клиент + rclone + zstd + скрипт
 backup.sh                       # вся логика (цикл, сжатие, S3, проверки, retention)
 docker-compose.example.yml      # как подключить: только image + environment
 stack.env.example               # пример env-файла (KEY=VALUE), см. «Env-файл»
@@ -54,7 +54,6 @@ make test-ls       # что лежит в S3-стенде
 make test-verify VER=pg15 DB=app   # отдельно перепроверить восстановление версии
 make test-retention VER=pg18 KEEP_CHECK=2 KEEP_RUNS=5   # отдельно перепроверить retention
 make test-faults    VER=pg18    # отдельно: падение pg_dump -> битый дамп не уезжает в S3
-make test-notify    VER=pg18    # отдельно: уведомления (ok/fail, NOTIFY_ON, NOTIFY_URL)
 make test-real-s3              # проверка РЕАЛЬНОГО S3 из .env (см. ниже)
 make test-down     # остановить и удалить данные стенда
 ```
@@ -75,8 +74,7 @@ make test-down     # остановить и удалить данные сте�
 | Фичи версии | 15 — `MERGE`, `UNIQUE NULLS NOT DISTINCT`; 16 — SQL/JSON конструкторы, `random_normal()`; 17 — `JSON_TABLE`, GUC `transaction_timeout`; 18 — `uuidv7()`, виртуальные генерируемые колонки |
 | Retention | заливаем `KEEP_RUNS` копий при `KEEP_CHECK` (`RUNS > KEEP`) и требуем, чтобы в S3 остались ровно `KEEP_CHECK` новейших, а старейшие были удалены (отдельный префикс, по умолчанию `2/5`) |
 | Fault injection | подставляем «падающий» `pg_dump` (падает сразу и падает, отдав валидное оглавление + часть данных) и требуем, чтобы `backup.sh` вернул ненулевой код и **ничего не загрузил** в S3 |
-| Уведомления | `NOTIFY_CMD` получает `ok`/`fail`, `NOTIFY_ON=failure` не спамит на успехе, `NOTIFY_URL` реально получает POST с телом `{"text": ...}` |
-| Проверка в S3 без egress | в логе подтверждение, что объект сверен по размеру, а для single-part — и по MD5/ETag; для multipart (PG17, ~13 МБ) подтверждается размер |
+| Уведомления | Проверка в S3 без egress | в логе подтверждение, что объект сверен по размеру, а для single-part — и по MD5/ETag; для multipart (PG17, ~13 МБ) подтверждается размер |
 
 Стенд запускает S3-совместимое хранилище `adobe/s3mock` (данные только в контейнере). Любой другой
 S3 подойдёт: чтобы взять MinIO, замените образ `s3` в `docker-compose.test.yml`.
@@ -89,7 +87,7 @@ S3 подойдёт: чтобы взять MinIO, замените образ `s
   работать в `test`/`backup`, чтобы retention не задел существующие бэкапы;
 - проверяет доступность бакета, `list`/`delete` (основа retention);
 - главное — **диагностирует скачивание**: авторитетно проверяет, не ломается ли restore из-за
-  автосумм CRC64 у aws-cli ≥ 2.23 (см. блок про aws-cli выше);
+  поведение rclone при скачивании;
 - прогоняет `backup.sh` против локального PostgreSQL в этот префикс и подтверждает выгрузку без
   скачивания (размер + MD5/ETag).
 
@@ -108,12 +106,12 @@ services:
       PGHOST: "postgres-db"          # имя сервиса БД в сети
       PGUSER: "postgres"
       PGPASSWORD: "CHANGE_ME"
+      S3_ENDPOINT: "https://s3.kz-1.srvstorage.kz"
+      S3_REGION: "kz-1"
+      S3_ACCESS_KEY_ID: "CHANGE_ME"
+      S3_SECRET_ACCESS_KEY: "CHANGE_ME"
       S3_BUCKET: "my-backups"
       S3_PREFIX: "myapp"
-      S3_ENDPOINT: ""                 # пусто = AWS; иначе https://s3.kz-1.srvstorage.kz
-      AWS_ACCESS_KEY_ID: "CHANGE_ME"
-      AWS_SECRET_ACCESS_KEY: "CHANGE_ME"
-      AWS_DEFAULT_REGION: "us-east-1"
       KEEP: "7"
     networks: [ backend ]            # та же сеть, что и БД
 ```
@@ -124,10 +122,11 @@ services:
 |---|---|---|
 | `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD` | — | подключение к БД |
 | `ADMIN_DB` | `postgres` | служебная БД для перечисления баз / версии |
-| `S3_BUCKET` | — | бакет |
-| `S3_PREFIX` | `backup` | префикс ключа |
-| `S3_ENDPOINT` | пусто (AWS) | S3-совместимый endpoint |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION` | — | креды S3 |
+| `S3_ENDPOINT` | — | endpoint, напр. `https://s3.kz-1.srvstorage.kz` |
+| `S3_REGION` | `us-east-1` | регион провайдера (напр. `kz-1`) |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | — | ключи доступа |
+| `S3_BUCKET` | — | бакет (уже существует; скрипт его не создаёт) |
+| `S3_PREFIX` | `backup` | подпапка в бакете |
 | `KEEP` | `7` | копий каждой базы |
 | `ZSTD_LEVEL` | `9` | уровень zstd (6=быстро … 19=плотнее) |
 | `INTERVAL` | `86400` | секунд между прогонами |
@@ -135,17 +134,11 @@ services:
 | `DUMP_GLOBALS` | `1` | выгружать роли/привилегии |
 | `VERIFY` | `1` | `zstd -t` + `pg_restore -l` перед загрузкой |
 | `VERIFY_FULL` | `1` | + полное чтение архива локально (`pg_restore -f /dev/null`) — ловит обрыв данных. Трафика нет |
-| `VERIFY_REMOTE` | `1` | проверка объекта в S3 **без скачивания**: размер + сумма/ETag |
+| `VERIFY_REMOTE` | `1` | проверка объекта в S3 **без скачивания**: размер + MD5 (для объектов < 200 МиБ) |
 | `VERIFY_DOWNLOAD` | `0` | `1` = дополнительно **скачать** объект из S3 и проверить целиком (это исходящий трафик) |
-| `S3_CHECKSUM_ALGORITHM` | `SHA256` | сквозная сумма на загрузке (`SHA256`/`CRC32`/`CRC32C`/`SHA1`; `""` — выкл.). Проверяется на приёмке S3; при отказе провайдера автоматически повторяем без суммы |
 | `RESTORE_TEST` | `0` | полный тест восстановления в скретч-БД |
 | `RUN_ONCE` | `0` | `1` = один прогон и выход (код возврата = были ли ошибки); для тестов/CI |
 | `WAIT_DB_TIMEOUT` | `0` | секунд ожидания БД при старте; `0` = ждать бесконечно |
-| `NOTIFY_ON` | `failure` | когда уведомлять: `failure` (только ошибки) или `always` |
-| `NOTIFY_URL` | (пусто) | webhook: POST `{"text": "..."}` (Slack/Discord/Mattermost/свой) |
-| `NOTIFY_CMD` | (пусто) | произвольная команда; получает `STATUS` (`ok`/`fail`) и `MESSAGE` |
-| `HEALTHCHECK_URL` | (пусто) | dead man's switch (healthchecks.io и подобные): GET при успехе; «нет пинга» = тревога |
-| `NOTIFY_TIMEOUT` | `15` | секунд на запрос уведомления |
 | `EXTRA_PGDUMP_ARGS` | (пусто) | доп. флаги `pg_dump` (напр. `--enable-row-security`, `--no-large-objects`) |
 | `ENV_FILE` | `/etc/pg-backup/env` | путь к файлу `KEY=VALUE` (см. ниже); переменные из окружения приоритетнее файла |
 
@@ -186,13 +179,10 @@ cp stack.env.example stack.env   # stack.env в .gitignore
 3. **`VERIFY_FULL=1` (по умолчанию)** — `unzstd -c <file> | pg_restore -f /dev/null` читает **весь**
    архив (все данные), но ничего не исполняет; БД и права не нужны. Это и есть гарантия «дамп не
    сломан», и она **локальная** — трафика нет.
-4. **После загрузки, без скачивания**: сверяется `ContentLength` с локальным размером; для
-   single-part объекта сравнивается `ETag` (это MD5) с локальным MD5; если провайдер отдаёт
-   `ChecksumSHA256` и объект не multipart — сверяется и он (у части провайдеров поле не отдаётся).
-   Для multipart подтверждается размер (побайтовая сверка там недоступна — см. про aws-cli ниже), а
-   байты проверяет сам S3 на приёмке по `S3_CHECKSUM_ALGORITHM=SHA256`.
-5. **`VERIFY_DOWNLOAD=1`** (по желанию, это **трафик**) — реально скачать объект и проверить целиком.
-   Разумно гонять изредка (например, раз в месяц), а не каждый прогон.
+4. **После загрузки, без скачивания**: `rclone ls` по подпапке — сверяем размер объекта с локальным
+   (ловит недолитую/отсутствующую загрузку). Трафика нет.
+5. **`VERIFY_DOWNLOAD=1`** (по желанию, это **трафик**) — `rclone copy` объекта обратно и полная
+   проверка архива. Разумно гонять изредка, а не каждый прогон.
 6. **`RESTORE_TEST=1`** (по желанию) — реальное восстановление в **временную** БД-скретч и `dropdb`.
    Единственная 100%-я проверка «бэкап восстанавливается»; нужна роль с `CREATEDB` (или суперюзер).
    Восстанавливается **локальный** файл (до загрузки) — трафика нет.
@@ -200,54 +190,24 @@ cp stack.env.example stack.env   # stack.env в .gitignore
 Всё это логируется в stdout (`verify: ...`, `SHA256/MD5 сверен с S3`, `restore-test OK`, `upload OK`).
 При провале любой проверки база помечается ошибкой, и дамп **не** загружается.
 
-> **Важно про aws-cli ≥ 2.23 и восстановление.** aws-cli сам добавляет суммы (CRC64) при загрузке.
-> У части S3-совместимых хранилищ такая сумма для multipart некорректна, и тогда `aws s3 cp`
-> **отказывается скачивать** объект (`Expected checksum ... did not match`) — то есть ломается
-> восстановление. Поэтому скрипт выставляет `request_checksum_calculation=when_required` и
-> `response_checksum_validation=when_required`, а сквозную `S3_CHECKSUM_ALGORITHM=SHA256` отправляет
-> **явно** (по умолчанию). Если провайдер сумму не принимает — автоматически повторяем загрузку без неё
-> (в логе `WARN: провайдер не принял SHA256`). Проверить СВОЙ провайдер: `make test-real-s3`.
-> Если `aws s3 cp` у вас всё же падает на скачивании — добавьте те же две настройки или скачивайте
-> через `aws ... s3api get-object --bucket B --key K out.zst`.
+> **Про хранилище.** Выгрузка идёт через `rclone`, подключение задаётся переменными окружения
+> (`S3_ENDPOINT`/`S3_REGION`/ключи) — файл `rclone.conf` не нужен.
+> Если провайдер продаёт трафик на скачивание, держите `VERIFY_DOWNLOAD=0` (по умолчанию) — тогда
+> данные из S3 не выкачиваются вообще: «не сломан ли дамп» проверяется локально, а доехал ли он —
+> по размеру через `rclone ls`.
 
 > Для абсолютной гарантии независимо от прогонов имеет смысл изредка делать ручной/отдельный
 > тест восстановления — «бэкап, который не восстанавливали, — не бэкап».
 
-## Уведомления об ошибках
-Скрипт умеет сам сообщить о проблеме — ничего отдельного ставить не нужно:
-
-| Переменная | Как использовать |
-|---|---|
-| `NOTIFY_URL` | webhook, POST `{"text": "..."}` — Slack, Discord, Mattermost, свой эндпоинт |
-| `NOTIFY_CMD` | любая команда; в окружении `STATUS` (`ok`/`fail`) и `MESSAGE` (напр. `curl` в Telegram/ntfy) |
-| `NOTIFY_ON` | `failure` (по умолчанию — только ошибки) или `always` (каждый прогон) |
-| `HEALTHCHECK_URL` | **dead man's switch**: GET только при успехе — «нет пинга» = тревога на стороне сервиса |
-
-Уведомление уходит: при завершении прогона с `failed=1`, при недоступной БД (`WAIT_DB_TIMEOUT`) и при
-«сервер новее клиента». Примеры:
-
-```yaml
-# Slack/Mattermost — самый простой вариант
-NOTIFY_URL: "https://hooks.slack.com/services/XXX/YYY/ZZZ"
-# Telegram через NOTIFY_CMD (токен и chat_id свои)
-NOTIFY_CMD: 'curl -fsS "https://api.telegram.org/bot<TOKEN>/sendMessage" --data-urlencode "chat_id=<CHAT>" --data-urlencode "text=$MESSAGE"'
-# dead man's switch: отсутствие пинга = алерт (ловит и «бэкап вообще не запустился»)
-HEALTHCHECK_URL: "https://hc-ping.com/<uuid>"
-```
-
-> Рекомендую **оба** типа: webhook ловит конкретную ошибку, а dead man's switch — ситуацию «контейнер
-> не запустился / не дошёл до конца». Первый без второго легко пропустить.
-
 ## Восстановление
 ```bash
-aws --endpoint-url "$S3_ENDPOINT" s3 cp s3://<bucket>/<prefix>/<db>/<ts>.dump.zst ./db.dump.zst
-unzstd -c db.dump.zst | pg_restore -l | less                       # посмотреть содержимое
-unzstd -c db.dump.zst | pg_restore -h <host> -U <user> -d <target_db> -j4 --no-owner --no-privileges
-unzstd -c globals.sql.zst | psql -h <host> -U <user> -d postgres   # роли
+# скачать последнюю копию базы
+rclone copy s3:backup-commercial-prod/<prefix>/<db>/ ./dump/ --include "<ts>.dump.zst"
+unzstd -c ./dump/<ts>.dump.zst | pg_restore -l | less                    # посмотреть содержимое
+unzstd -c ./dump/<ts>.dump.zst | pg_restore -h <host> -U <user> -d <target_db> -j4 --no-owner --no-privileges
+rclone ls s3:backup-commercial-prod/<prefix>/_globals/                 # список globals-дампов
+unzstd -c <ts>.sql.zst | psql -h <host> -U <user> -d postgres            # роли
 ```
-Если `aws s3 cp` падает с `Expected checksum ... did not match calculated checksum` (см. блок про
-aws-cli выше) — добавьте `aws configure set default.response_checksum_validation when_required` или
-скачивайте через `s3api get-object`.
 `<db>.dump.zst` — custom-формат pg_dump, целиком сжатый zstd; `pg_restore` напрямую `.zst` не читает,
 поэтому распаковываем через `unzstd -c | pg_restore`.
 
@@ -276,7 +236,6 @@ aws-cli выше) — добавьте `aws configure set default.response_check
 ## Нюансы (грабли, уже учтены в коде)
 - **Сжатие внешним zstd** по всему архиву, а не `-Z zstd` внутри: встроенное жмёт по сегментам и на
   мелких/средних базах проигрывает в разы.
-- **`--only-show-errors` нельзя у `s3api`** (aws-cli v2) — флаг только у `s3 cp/rm`.
 - **path-style** обязателен для части S3-совместимых хранилищ — выставляется в скрипте.
 - В swarm `restart`/`container_name`/`depends_on` игнорируются — используется `deploy.*` и `pg_isready`.
 - Логи: swarm — `docker service logs -f <stack>_pg-backup`, compose — `docker compose logs -f pg-backup`.

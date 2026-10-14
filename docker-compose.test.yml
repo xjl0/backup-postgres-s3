@@ -10,10 +10,14 @@
 #
 # Смотреть процесс: make test-logs. Один прогон, затем контейнер выходит с кодом 0/1.
 #
-# Любой S3-совместимый сервис подойдёт: чтобы взять MinIO, замените образ s3 на
-# minio/minio (и s3-init на minio/mc с `mc mb --ignore-existing local/pg-backup-test`).
+# Любой S3-совместимый сервис подойдёт: чтобы взять MinIO, замените образ s3 на minio/minio.
+# Бакет для стенда создаёт run-all.sh; сам скрипт бэкапа бакеты НЕ создаёт.
 
 name: pg-s3-backup-test          # фиксируем имя проекта: сеть pg-s3-backup-test_testnet
+
+x-rclone-env: &rclone-env
+  # S3-стенд: подключение rclone задаётся в test/s3env.sh (s3mock)
+  S3_BUCKET: pg-backup-test
 
 x-postgres: &postgres-base
   environment:
@@ -59,22 +63,6 @@ services:
     stop_grace_period: 0s                   # не даём JVM печатать дамп памяти при остановке
     networks: [testnet]
 
-  s3-init:
-    image: amazon/aws-cli:latest
-    depends_on: [s3]
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        EP="--endpoint-url http://s3:9090"
-        until aws $$EP s3api list-buckets >/dev/null 2>&1; do sleep 1; done
-        aws $$EP s3api create-bucket --bucket pg-backup-test >/dev/null 2>&1 || true
-        echo "S3 готов, бакет pg-backup-test создан"
-    environment:
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      AWS_DEFAULT_REGION: us-east-1
-    networks: [testnet]
-
   runner:
     image: pg-s3-backup-test-runner       # фиксированный тег: удобно запускать docker run-ом
     build:
@@ -86,24 +74,19 @@ services:
       pg16:    {condition: service_healthy}
       pg17:    {condition: service_healthy}
       pg18:    {condition: service_healthy}
-      s3-init: {condition: service_completed_successfully}
+      s3:      {condition: service_started}
     entrypoint: ["/bin/sh", "/run-all.sh"]
     environment:
       # БД (PGHOST подставляется по версии в run-all.sh)
       PGUSER: postgres
       PGPASSWORD: postgres
       ADMIN_DB: postgres
-      # S3 = локальный стенд
-      S3_BUCKET: pg-backup-test
-      S3_ENDPOINT: http://s3:9090
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      AWS_DEFAULT_REGION: us-east-1
+      # S3 = локальный стенд (rclone)
+      <<: *rclone-env
       # максимально строгий режим проверок
       VERIFY: "1"
       VERIFY_FULL: "1"
       VERIFY_DOWNLOAD: "0"      # 0 = не скачивать объект из S3 (исходящий трафик)
-      # S3_CHECKSUM_ALGORITHM намеренно не задан — стенд проверяет значение по умолчанию
       VERIFY_REMOTE: "1"
       RESTORE_TEST: "1"
       DUMP_GLOBALS: "1"
@@ -116,10 +99,10 @@ services:
       WAIT_DB_TIMEOUT: "180"
     volumes:
       - ./test/run-all.sh:/run-all.sh:ro
+      - ./test/s3env.sh:/s3env.sh:ro
       - ./test/verify.sh:/verify.sh:ro
       - ./test/retention.sh:/retention.sh:ro
       - ./test/faults.sh:/faults.sh:ro
-      - ./test/notify.sh:/notify.sh:ro
       - ./test/checks:/checks:ro
     networks: [testnet]
 

@@ -6,7 +6,7 @@
 #   4) прогоняем версионную проверку /checks/<ver>.sql (фичи конкретного мажора).
 #
 # Использование: verify.sh <pg15|pg16|pg17|pg18> [db=app]
-# Переменные: PGHOST/PGPORT/PGUSER/PGPASSWORD, S3_BUCKET/S3_PREFIX/S3_ENDPOINT, AWS_*.
+# Переменные: PGHOST/PGPORT/PGUSER/PGPASSWORD, S3_BUCKET/S3_PREFIX (rclone).
 set -eu
 
 VER="${1:?нужен аргумент версии, напр. pg18}"
@@ -20,11 +20,7 @@ EXPECT_MAJOR="${VER#pg}"
 export PGPASSWORD
 PGPORT="${PGPORT:-5432}"
 S3_PREFIX="${S3_PREFIX:-backup}"
-EP=""; [ -n "${S3_ENDPOINT:-}" ] && EP="--endpoint-url $S3_ENDPOINT"
-aws configure set default.s3.addressing_style path >/dev/null 2>&1 || true
-# см. backup.sh: не даём aws-cli навешивать составные суммы, из-за которых может ломаться скачивание
-aws configure set default.request_checksum_calculation when_required >/dev/null 2>&1 || true
-aws configure set default.response_checksum_validation when_required >/dev/null 2>&1 || true
+. /s3env.sh
 
 SCRATCH="verify_${VER}_$(date -u +%s)_$$"
 TMP="$(mktemp -d)"
@@ -41,15 +37,18 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # 1) последний объект под префиксом базы
-key="$(aws $EP s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$S3_PREFIX/$DB/" \
-        --query 'sort_by(Contents,&Key)[].Key' --output text 2>/dev/null \
-        | tr '\t' '\n' | grep . | tail -n 1)"
+rel="$(s3_list "$S3_PREFIX/$DB/" | tail -n 1)"
+key=""
+[ -n "$rel" ] && key="$S3_PREFIX/$DB/$rel"
 if [ -z "$key" ]; then
   log "ОШИБКА: нет объектов s3://$S3_BUCKET/$S3_PREFIX/$DB/"; exit 1
 fi
-log "последний дамп: $key (скачиваю — это глубокий тест на локальном S3, трафик не платный)"
+log "последний дамп: $key (скачиваю — это глубокий тест, трафик считаем допустимым)"
 
-aws $EP --only-show-errors s3 cp "s3://$S3_BUCKET/$key" "$TMP/db.dump.zst" >/dev/null
+mkdir -p "$TMP/dl"
+rclone $RCLONE_OPTS copy "$(s3path "$key")" "$TMP/dl" >/dev/null 2>&1 || { log "ОШИБКА: не скачать $key"; exit 1; }
+dl="$(ls "$TMP/dl" | head -1)"
+mv "$TMP/dl/$dl" "$TMP/db.dump.zst"
 log "скачано $(wc -c <"$TMP/db.dump.zst") B"
 zstd -t "$TMP/db.dump.zst" >/dev/null 2>&1 || { log "ОШИБКА: zstd -t FAILED"; exit 1; }
 unzstd -c "$TMP/db.dump.zst" | pg_restore -l >/dev/null 2>&1 || { log "ОШИБКА: pg_restore -l FAILED"; exit 1; }

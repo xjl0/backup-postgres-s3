@@ -54,17 +54,13 @@ export PGPASSWORD="${PGPASSWORD:?нужен PGPASSWORD}"
 export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}"
 ADMIN_DB="${ADMIN_DB:-postgres}"          # служебная БД для перечисления/версии (fallback: template1)
 
-# --- S3 ---
+# --- S3 (rclone) ---
 S3_BUCKET="${S3_BUCKET:?нужен S3_BUCKET}"
 S3_PREFIX="${S3_PREFIX:-backup}"
-S3_ENDPOINT="${S3_ENDPOINT:-}"            # пусто = AWS S3; иначе S3-совместимый endpoint
-S3_CHECKSUM_ALGORITHM="${S3_CHECKSUM_ALGORITHM:-SHA256}"  # SHA256/CRC32/CRC32C/SHA1 или "" (выкл).
-                                                          # S3 проверяет байты при приёмке → сквозная
-                                                          # гарантия целостности без скачивания.
-                                                          # ЕСЛИ у вашего хранилища составная сумма
-                                                          # multipart некорректна, aws-cli может не
-                                                          # скачать объект: проверьте `make test-real-s3`
-                                                          # и при проблемах поставьте S3_CHECKSUM_ALGORITHM="".
+S3_ENDPOINT="${S3_ENDPOINT:-}"
+S3_REGION="${S3_REGION:-us-east-1}"
+S3_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-}}"
+S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-}}"
 KEEP="${KEEP:-7}"
 ZSTD_LEVEL="${ZSTD_LEVEL:-9}"
 INTERVAL="${INTERVAL:-86400}"
@@ -75,7 +71,7 @@ DUMP_GLOBALS="${DUMP_GLOBALS:-1}"
 VERIFY="${VERIFY:-1}"            # zstd -t + pg_restore -l (оглавление) перед загрузкой
 VERIFY_FULL="${VERIFY_FULL:-1}"  # + полное чтение архива (pg_restore -f /dev/null) — ловит обрыв данных.
                                  # Локально, без исходящего трафика; VERIFY_FULL=0 — быстрее, но слабее.
-VERIFY_REMOTE="${VERIFY_REMOTE:-1}"      # проверка объекта в S3 без скачивания (размер + контрольная сумма)
+VERIFY_REMOTE="${VERIFY_REMOTE:-1}"      # проверка объекта в S3 без скачивания (сверка размера)
 VERIFY_DOWNLOAD="${VERIFY_DOWNLOAD:-0}"  # 1 = дополнительно СКАЧАТЬ объект и проверить целиком (это трафик!)
 RESTORE_TEST="${RESTORE_TEST:-0}"
 
@@ -86,16 +82,30 @@ EXTRA_PGDUMP_ARGS="${EXTRA_PGDUMP_ARGS:-}"
 RUN_ONCE="${RUN_ONCE:-0}"        # 1 = один прогон и выход (для тестов/CI); код возврата = failed
 WAIT_DB_TIMEOUT="${WAIT_DB_TIMEOUT:-0}"   # сек ожидания БД при старте; 0 = ждать бесконечно
 
-# --- уведомления об ошибках ---
-NOTIFY_ON="${NOTIFY_ON:-failure}"        # failure (только ошибки) | always (каждый прогон)
-NOTIFY_URL="${NOTIFY_URL:-}"             # webhook: POST {"text": "..."} (Slack/Discord/Mattermost)
-NOTIFY_CMD="${NOTIFY_CMD:-}"             # произвольная команда; получает STATUS и MESSAGE в окружении
-HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"   # dead man's switch (healthchecks.io и подобные): GET при успехе
-NOTIFY_TIMEOUT="${NOTIFY_TIMEOUT:-15}"   # сек на запрос уведомления
-
 WORKDIR="${WORKDIR:-/tmp/pg-backup}"
-EP=""; [ -n "$S3_ENDPOINT" ] && EP="--endpoint-url $S3_ENDPOINT"
-CK=""; [ -n "$S3_CHECKSUM_ALGORITHM" ] && CK="--checksum-algorithm $S3_CHECKSUM_ALGORITHM"
+
+# --- rclone: подключение из переменных окружения; потоки загрузки всегда 4, остальное по умолчанию ---
+export RCLONE_CONFIG="${RCLONE_CONFIG:-/etc/rclone/rclone.conf}"   # пустая заглушка (создаётся в образе)
+export RCLONE_CONFIG_S3_TYPE=s3
+export RCLONE_CONFIG_S3_PROVIDER="${RCLONE_CONFIG_S3_PROVIDER:-Selectel}"
+export RCLONE_CONFIG_S3_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:?нужен S3_ACCESS_KEY_ID}"
+export RCLONE_CONFIG_S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:?нужен S3_SECRET_ACCESS_KEY}"
+export RCLONE_CONFIG_S3_REGION="$S3_REGION"
+[ -n "$S3_ENDPOINT" ] && export RCLONE_CONFIG_S3_ENDPOINT="$S3_ENDPOINT"
+RCLONE_OPTS="--s3-upload-concurrency 4 --stats=15s --stats-one-line -v"
+S3R="s3"   # имя remote; должно совпадать с префиксом RCLONE_CONFIG_<NAME>_* выше
+s3path() { printf '%s:%s/%s' "$S3R" "$S3_BUCKET" "$1"; }   # $1 = путь внутри бакета
+# Бакет НЕ создаём: он уже есть, объекты пишутся в подпапки (префиксы).
+
+# запуск rclone: вывод (прогресс/события) идёт в лог, код возврата — в RCLONE_RC
+RCLONE_RC=0
+rclone_run() {
+  _rcf="$WORKDIR/.rclone.rc"; rm -f "$_rcf"
+  { rclone $RCLONE_OPTS "$@"; echo $? >"$_rcf"; } 2>&1 \
+    | while IFS= read -r _ln; do [ -n "$_ln" ] && log "    rclone| $_ln"; done
+  RCLONE_RC="$(cat "$_rcf" 2>/dev/null || echo 1)"
+  rm -f "$_rcf"
+}
 
 # пауза до следующего прогона; при RUN_ONCE=1 — выход с кодом $1 (0 = успех, 1 = были ошибки)
 next_run() {
@@ -103,61 +113,20 @@ next_run() {
   sleep "$INTERVAL"
 }
 
-# --- уведомления ---
-json_escape() { printf '%s' "$1" | tr -d '\n\r' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-
-notify() {  # $1 = ok|fail, $2 = текст
-  status="$1"; msg="$2"
-  [ "$NOTIFY_ON" = "always" ] || [ "$status" = "fail" ] || return 0
-  [ -n "$NOTIFY_URL" ] || [ -n "$NOTIFY_CMD" ] || return 0
-  full="pg-s3-backup [$status] run=${TS:-startup} host=${PGHOST} bucket=${S3_BUCKET} prefix=${S3_PREFIX}: $msg"
-  log "уведомление: $full"
-  if [ -n "$NOTIFY_CMD" ]; then
-    STATUS="$status" MESSAGE="$full" sh -c "$NOTIFY_CMD" >/dev/null 2>&1 || log "WARN: NOTIFY_CMD вернул ошибку"
-  fi
-  if [ -n "$NOTIFY_URL" ]; then
-    body="{\"text\":\"$(json_escape "$full")\"}"
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsS -m "$NOTIFY_TIMEOUT" -X POST -H 'Content-Type: application/json' --data "$body" "$NOTIFY_URL" >/dev/null 2>&1 \
-        || log "WARN: не удалось отправить на NOTIFY_URL"
-    else
-      wget -q -T "$NOTIFY_TIMEOUT" --header 'Content-Type: application/json' --post-data "$body" -O /dev/null "$NOTIFY_URL" 2>/dev/null \
-        || log "WARN: не удалось отправить на NOTIFY_URL (wget)"
-    fi
-  fi
-}
-
-ping_healthcheck() {  # dead man's switch: пингуем только при успехе; «нет пинга» = алерт на стороне сервиса
-  [ -n "$HEALTHCHECK_URL" ] || return 0
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsS -m "$NOTIFY_TIMEOUT" "$HEALTHCHECK_URL" >/dev/null 2>&1 || log "WARN: healthcheck ping не удался"
-  else
-    wget -q -T "$NOTIFY_TIMEOUT" -O /dev/null "$HEALTHCHECK_URL" 2>/dev/null || log "WARN: healthcheck ping не удался"
-  fi
-}
-
 # --- инструменты ---
-command -v aws  >/dev/null 2>&1 || apk add --no-cache aws-cli >/dev/null 2>&1
-command -v zstd >/dev/null 2>&1 || apk add --no-cache zstd    >/dev/null 2>&1
-command -v aws  >/dev/null 2>&1 || { log "FATAL: нет aws-cli"; exit 1; }
-command -v zstd >/dev/null 2>&1 || { log "FATAL: нет zstd";    exit 1; }
-aws configure set default.s3.addressing_style path >/dev/null 2>&1 || true
-# aws-cli >= 2.23 по умолчанию сам добавляет суммы (CRC64) на загрузке. У части S3-совместимых
-# хранилищ такая сумма для multipart некорректна, и тогда aws-cli ОТКАЗЫВАЕТСЯ скачивать объект —
-# то есть ломается восстановление. Поэтому не навязываем суммы, если их не просят явно.
-# (Явная сквозная сумма — S3_CHECKSUM_ALGORITHM=... — для AWS S3, где она реализована корректно.)
-aws configure set default.request_checksum_calculation when_required >/dev/null 2>&1 || true
-aws configure set default.response_checksum_validation when_required >/dev/null 2>&1 || true
+command -v rclone >/dev/null 2>&1 || apk add --no-cache rclone >/dev/null 2>&1
+command -v zstd   >/dev/null 2>&1 || apk add --no-cache zstd   >/dev/null 2>&1
+command -v rclone >/dev/null 2>&1 || { log "FATAL: нет rclone"; exit 1; }
+command -v zstd   >/dev/null 2>&1 || { log "FATAL: нет zstd";   exit 1; }
 
 mkdir -p "$WORKDIR"
 
 # --- эффективная конфигурация (пароли не логируем) ---
 log "--- конфигурация ---"
 log "  БД:        PGHOST=$PGHOST PGPORT=$PGPORT PGUSER=$PGUSER ADMIN_DB=$ADMIN_DB (PGPASSWORD=***)"
-log "  S3:        bucket=$S3_BUCKET prefix=$S3_PREFIX endpoint=${S3_ENDPOINT:-<AWS>} region=${AWS_DEFAULT_REGION:-<default>}"
+log "  S3:        bucket=$S3_BUCKET prefix=$S3_PREFIX provider=$RCLONE_CONFIG_S3_PROVIDER region=$S3_REGION endpoint=${S3_ENDPOINT:-<AWS>}"
 log "  режим:     KEEP=$KEEP ZSTD_LEVEL=$ZSTD_LEVEL INTERVAL=${INTERVAL}s RUN_ONCE=$RUN_ONCE EXCLUDE_DBS='$EXCLUDE_DBS' DUMP_GLOBALS=$DUMP_GLOBALS"
-log "  проверки:  VERIFY=$VERIFY VERIFY_FULL=$VERIFY_FULL VERIFY_REMOTE=$VERIFY_REMOTE VERIFY_DOWNLOAD=$VERIFY_DOWNLOAD RESTORE_TEST=$RESTORE_TEST S3_CHECKSUM='$S3_CHECKSUM_ALGORITHM'"
-log "  алерты:    NOTIFY_ON=$NOTIFY_ON NOTIFY_URL=${NOTIFY_URL:-нет} NOTIFY_CMD=${NOTIFY_CMD:+задан}${NOTIFY_CMD:-нет} HEALTHCHECK_URL=${HEALTHCHECK_URL:-нет}"
+log "  проверки:  VERIFY=$VERIFY VERIFY_FULL=$VERIFY_FULL VERIFY_REMOTE=$VERIFY_REMOTE VERIFY_DOWNLOAD=$VERIFY_DOWNLOAD RESTORE_TEST=$RESTORE_TEST"
 log "  прочее:    WORKDIR=$WORKDIR WAIT_DB_TIMEOUT=${WAIT_DB_TIMEOUT}s EXTRA_PGDUMP_ARGS='$EXTRA_PGDUMP_ARGS' ENV_FILE=$ENV_FILE"
 
 # версия клиента (одна на весь прогон)
@@ -167,20 +136,19 @@ CLIENT_MAJOR="$(pg_dump --version | sed -n 's/.* \([0-9][0-9]*\)\..*/\1/p')"
 psqlA() { psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$ADMIN_DB" -At "$@"; }
 
 retain() {
-  prefix="$1"
-  keys="$(aws $EP s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$prefix" \
-            --query 'sort_by(Contents,&Key)[].Key' --output text 2>/dev/null)"
+  prefix="$1"     # напр. "zooclub/app/" — путь внутри бакета
+  keys="$(rclone ls "$(s3path "$prefix")" 2>/dev/null | awk '{print $2}' | grep . | sort)"
   [ -z "$keys" ] && { log "  retention $prefix: объектов нет"; return 0; }
-  count="$(printf '%s\n' "$keys" | tr '\t' '\n' | grep -c .)"
+  count="$(printf '%s\n' "$keys" | grep -c .)"
   if [ "$count" -le "$KEEP" ]; then
     log "  retention $prefix: $count объектов, удалять нечего (KEEP=$KEEP)"
     return 0
   fi
   drop=$((count - KEEP))
   log "  retention $prefix: $count объектов, удаляю $drop старейших (KEEP=$KEEP)"
-  printf '%s\n' "$keys" | tr '\t' '\n' | grep . | head -n "$drop" | while IFS= read -r k; do
-    [ -n "$k" ] && aws $EP --only-show-errors s3 rm "s3://$S3_BUCKET/$k" >/dev/null 2>&1 \
-      && log "    удалён $k"
+  printf '%s\n' "$keys" | head -n "$drop" | while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    rclone deletefile "$(s3path "$prefix$rel")" >/dev/null 2>&1 && log "    удалён $prefix$rel"
   done
 }
 
@@ -200,47 +168,36 @@ verify_archive() {
   return 0
 }
 
-# Проверка объекта в S3 БЕЗ скачивания данных: размер + контрольная сумма.
-#  - размер (ContentLength) ловит недолитую/отсутствующую загрузку;
-#  - ChecksumSHA256 (если провайдер отдал и объект не multipart) сверяем точно;
-#  - для multipart S3 отдаёт composite-сумму (…-N) — её локально не собрать, но S3 уже
-#    проверил байты на приёмке (мы грузим с --checksum-algorithm), поэтому просто фиксируем;
-#  - ETag == MD5 только для single-part без SSE-KMS, поэтому MD5 — информационно.
-# Ноль исходящего трафика.
+# Проверка объекта в S3 БЕЗ скачивания: сверяем размер по `rclone ls`.
+# (MD5/ETag у multipart-объектов не равен MD5 файла, поэтому полагаемся на размер + локальную
+#  проверку архива до загрузки; VERIFY_DOWNLOAD=1 — опционально скачать и проверить целиком.)
 verify_remote_object() {
   key="$1"; f="$2"
-  remote_sz="$(aws $EP s3api head-object --bucket "$S3_BUCKET" --key "$key" --query ContentLength --output text 2>/dev/null)"
+  dir="${key%/*}/"; base="${key##*/}"
   local_sz="$(wc -c <"$f")"
+
+  # 1) размер
+  remote_sz="$(rclone ls "$(s3path "$dir")" 2>/dev/null | awk -v b="$base" '$2==b {print $1; exit}')"
   if [ "${remote_sz:-}" != "$local_sz" ]; then
     log "  ERROR: размер в S3 (${remote_sz:-нет}) != локального ($local_sz)"; return 1
   fi
   log "  размер в S3 сверен: $remote_sz B (без скачивания)"
 
-  etag_raw="$(aws $EP s3api head-object --bucket "$S3_BUCKET" --key "$key" --query ETag --output text 2>/dev/null)"
-  csha="$(aws $EP s3api head-object --bucket "$S3_BUCKET" --key "$key" --checksum-mode ENABLED \
-            --query ChecksumSHA256 --output text 2>/dev/null || true)"
-
-  case "${csha:-}" in
-    ''|None) : ;;                                   # провайдер не отдал — идём к ETag
-    *-*) log "  SHA256 (multipart composite $csha): проверен S3 при загрузке"; ;;
-    *)
-      local_hex="$(sha256sum "$f" | cut -d' ' -f1)"
-      remote_hex="$(printf '%s' "$csha" | base64 -d 2>/dev/null | od -An -tx1 | tr -d ' \n')"
-      if [ -n "$remote_hex" ] && [ "$local_hex" = "$remote_hex" ]; then
-        log "  SHA256 сверен с S3 (без скачивания)"
-        return 0
+  # 2) MD5. В S3 ETag == MD5 только для объектов, загруженных одним запросом (не multipart).
+  # rclone грузит одним запросом всё, что меньше ~200 МиБ, поэтому сумму сверяем только для таких.
+  if [ "$local_sz" -lt 209715200 ]; then
+    remote_md5="$(rclone md5sum "$(s3path "$key")" 2>/dev/null | awk '{print $1}')"
+    if [ -n "$remote_md5" ]; then
+      local_md5="$(md5sum "$f" | cut -d' ' -f1)"
+      if [ "$remote_md5" = "$local_md5" ]; then
+        log "  MD5 сверен с S3 (без скачивания)"
+      else
+        log "  ERROR: MD5 в S3 ($remote_md5) != локального ($local_md5)"; return 1
       fi
-      log "  ERROR: SHA256 в S3 не совпал с локальным"; return 1 ;;
-  esac
-
-  et="$(printf '%s' "$etag_raw" | tr -d '"')"
-  case "$et" in
-    ''|None) log "  WARN: S3 не вернул ETag для проверки" ;;
-    *-*) log "  ETag multipart ($et): побайтовая сверка недоступна, подтверждён размер" ;;
-    *)   lmd5="$(md5sum "$f" | cut -d' ' -f1)"
-         if [ "$lmd5" = "$et" ]; then log "  MD5 (ETag) сверен с S3 (без скачивания)"
-         else log "  WARN: ETag ($et) != MD5 ($lmd5) — норма для SSE-KMS/некоторых провайдеров"; fi ;;
-  esac
+    fi
+  else
+    log "  MD5 не сравниваем: объект ≥ 200 МиБ (multipart, ETag != MD5)"
+  fi
   return 0
 }
 
@@ -250,7 +207,6 @@ waited=0
 while ! pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -q; do
   if [ "$WAIT_DB_TIMEOUT" -gt 0 ] && [ "$waited" -ge "$WAIT_DB_TIMEOUT" ]; then
     log "FATAL: БД $PGHOST:$PGPORT не поднялась за ${WAIT_DB_TIMEOUT}s"
-    notify fail "БД $PGHOST:$PGPORT не поднялась за ${WAIT_DB_TIMEOUT}s"
     exit 1
   fi
   sleep 3; waited=$((waited + 3))
@@ -299,7 +255,6 @@ while true; do
   detect_env
   if [ "$SERVER_MAJOR" -gt "$CLIENT_MAJOR" ]; then
     log "ERROR: сервер (${SERVER_MAJOR}) > клиента (${CLIENT_MAJOR}) — пропускаю прогон. Нужен образ с PG_MAJOR>=${SERVER_MAJOR}."
-    notify fail "сервер PostgreSQL ${SERVER_MAJOR} новее клиента pg_dump ${CLIENT_MAJOR} — нужен образ с PG_MAJOR>=${SERVER_MAJOR}"
     next_run 1
   fi
   # cross-version (клиент и сервер разных мажоров) — рекомендуют quote-all-identifiers
@@ -315,15 +270,19 @@ while true; do
     # NB: статус конвейера в POSIX sh = статус последней команды (zstd), поэтому код возврата
     # pg_dumpall пишем в файл — иначе оборванный globals-дамп можно принять за валидный.
     gstat_f="$WORKDIR/.globals.rc"; rm -f "$gstat_f"; gz=0
+    gout="$WORKDIR/$TS.sql.zst"
     { pg_dumpall -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" --globals-only --no-role-passwords; echo $? > "$gstat_f"; } 2>/dev/null \
-      | zstd -q -6 -c > "$WORKDIR/_globals.sql.zst" || gz=$?
+      | zstd -q -6 -c > "$gout" || gz=$?
     gstat="$(cat "$gstat_f" 2>/dev/null || echo 1)"; rm -f "$gstat_f"
     if [ "$gstat" = "0" ] && [ "$gz" = "0" ]; then
-      log "  размер globals: $(wc -c <"$WORKDIR/_globals.sql.zst") B"
-      aws $EP --only-show-errors s3 cp "$WORKDIR/_globals.sql.zst" \
-          "s3://$S3_BUCKET/$S3_PREFIX/_globals/$TS.sql.zst" $CK \
-        && { log "upload OK: $S3_PREFIX/_globals/$TS.sql.zst"; retain "$S3_PREFIX/_globals/"; } \
-        || { log "ERROR: globals upload failed"; FAILED=1; }
+      log "  размер globals: $(wc -c <"$gout") B"
+      rclone_run copy "$gout" "$(s3path "$S3_PREFIX/_globals/")"
+      if [ "$RCLONE_RC" = "0" ]; then
+        log "upload OK: $S3_PREFIX/_globals/$TS.sql.zst"; retain "$S3_PREFIX/_globals/"
+      else
+        log "ERROR: globals upload failed"; FAILED=1
+      fi
+      rm -f "$gout"
     else
       log "ERROR: globals не выгружены (pg_dumpall=$gstat, zstd=$gz)"; FAILED=1
     fi
@@ -349,7 +308,8 @@ while true; do
 
     log "dump: $db (сервер ${SERVER_MAJOR}, клиент ${CLIENT_MAJOR}${CROSS:+, cross-version})"
     log "  команда: pg_dump -Fc -Z0 $CROSS $EXTRA_PGDUMP_ARGS -d '$db' | zstd -$ZSTD_LEVEL"
-    out="$WORKDIR/$db.dump.zst"
+    mkdir -p "$WORKDIR/$db"
+    out="$WORKDIR/$db/$TS.dump.zst"
     dstat_f="$WORKDIR/.${db}.rc"; rm -f "$dstat_f"
     dump_t0="$(date +%s)"
     # NB: в POSIX sh статус конвейера = статус последней команды (zstd), поэтому падение
@@ -403,17 +363,20 @@ while true; do
     fi
 
     key="$S3_PREFIX/$db/$TS.dump.zst"
-    log "  загрузка: $out -> s3://$S3_BUCKET/$key${S3_CHECKSUM_ALGORITHM:+ (сквозная сумма $S3_CHECKSUM_ALGORITHM)}"
-    ck="$CK"
-    up_ok=1
-    if ! aws $EP --only-show-errors s3 cp "$out" "s3://$S3_BUCKET/$key" $ck 2>"$WORKDIR/.cp.err"; then
-      if [ -n "$ck" ] && grep -qiE 'checksum|not implemented|InvalidRequest' "$WORKDIR/.cp.err"; then
-        log "  WARN: провайдер не принял $S3_CHECKSUM_ALGORITHM — повтор без контрольной суммы"
-        aws $EP --only-show-errors s3 cp "$out" "s3://$S3_BUCKET/$key" || up_ok=0
-      else
-        up_ok=0
+    log "  загрузка: $out -> $S3_BUCKET/$key"
+    up_ok=0
+    attempt=1
+    while [ "$attempt" -le 3 ]; do
+      log "  rclone copy: попытка $attempt/3"
+      rclone_run copy "$out" "$(s3path "$S3_PREFIX/$db/")"
+      [ "$RCLONE_RC" = "0" ] && { up_ok=1; break; }
+      log "  WARN: попытка $attempt/3 не удалась (см. вывод rclone выше)"
+      attempt=$((attempt + 1))
+      if [ "$attempt" -le 3 ]; then
+        log "  повтор через 10s"
+        sleep 10
       fi
-    fi
+    done
     if [ "$up_ok" = "1" ]; then
       if [ "$VERIFY_REMOTE" = "1" ]; then
         verify_remote_object "$key" "$out" || FAILED=1
@@ -422,13 +385,14 @@ while true; do
       fi
       if [ "$VERIFY_DOWNLOAD" = "1" ]; then
         log "  VERIFY_DOWNLOAD=1: скачиваю объект и проверяю полностью (это исходящий трафик!)"
-        if aws $EP s3api get-object --bucket "$S3_BUCKET" --key "$key" "$WORKDIR/_dl.zst" >/dev/null 2>&1 \
-           && verify_archive "$WORKDIR/_dl.zst"; then
+        rm -rf "$WORKDIR/_dl"; mkdir -p "$WORKDIR/_dl"
+        rclone_run copy "$(s3path "$key")" "$WORKDIR/_dl"
+        if [ "$RCLONE_RC" = "0" ] && verify_archive "$WORKDIR/_dl/$TS.dump.zst"; then
           log "  скачанный из S3 объект цел"
         else
           log "  ERROR: скачанный из S3 объект повреждён"; FAILED=1
         fi
-        rm -f "$WORKDIR/_dl.zst"
+        rm -rf "$WORKDIR/_dl"
       fi
       retain "$S3_PREFIX/$db/"
     else
@@ -439,11 +403,5 @@ while true; do
   done
 
   log "прогон завершён. failed=$FAILED, всего за $(( $(date +%s) - run_t0 ))s; следующий через ${INTERVAL}s"
-  if [ "$FAILED" = "0" ]; then
-    notify ok "прогон ${TS} успешен: баз обработано, ошибок нет"
-    ping_healthcheck
-  else
-    notify fail "прогон ${TS} завершился с ошибками (failed=1) — смотрите логи"
-  fi
   next_run "$FAILED"
 done

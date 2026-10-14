@@ -3,7 +3,7 @@
 # ровно KEEP самых новых, а старые удалены. Гоняем backup.sh с RUN_ONCE=1 и малым KEEP.
 #
 # Использование: retention.sh <pgXX> [keep=2] [runs=5]   (runs должно быть > keep)
-# Переменные: PGHOST/PGPORT/PGUSER/PGPASSWORD, S3_BUCKET/S3_ENDPOINT, AWS_*.
+# Переменные: PGHOST/PGPORT/PGUSER/PGPASSWORD, S3_BUCKET/S3_PREFIX (rclone).
 set -eu
 
 VER="${1:?нужен аргумент версии, напр. pg18}"
@@ -18,8 +18,7 @@ RUNS="${3:-5}"
 export PGPASSWORD
 export S3_PREFIX="test/retention-$VER"     # отдельный префикс, чтобы не мешать основным бэкапам
 PGPORT="${PGPORT:-5432}"
-EP=""; [ -n "${S3_ENDPOINT:-}" ] && EP="--endpoint-url $S3_ENDPOINT"
-aws configure set default.s3.addressing_style path >/dev/null 2>&1 || true
+. /s3env.sh
 
 DB="app"
 PREFIX="$S3_PREFIX/$DB/"
@@ -27,22 +26,18 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 log() { echo "[retention $VER] $*"; }
 
-# все ключи под префиксом, по возрастанию (старые -> новые)
+# все ключи (полные) под префиксом, по возрастанию (старые -> новые)
 list_keys() {
-  aws $EP s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$PREFIX" \
-    --query 'sort_by(Contents,&Key)[].Key' --output text 2>/dev/null \
-    | tr '\t' '\n' | grep . | grep -v '^None$' || true
+  s3_list "$PREFIX" | while IFS= read -r r; do [ -n "$r" ] && printf '%s\n' "$PREFIX$r"; done
 }
 
 # чистим префикс от прошлых прогонов, чтобы счёт был детерминированным
 del_all() {
-  for k in $(list_keys); do
-    aws $EP --only-show-errors s3 rm "s3://$S3_BUCKET/$k" >/dev/null 2>&1 || true
-  done
+  for k in $(list_keys); do s3_del "$k"; done
 }
 
 del_all
-log "старт: KEEP=$KEEP_R, прогонов=$RUNS, префикс s3://$S3_BUCKET/$PREFIX"
+log "старт: KEEP=$KEEP_R, прогонов=$RUNS, префикс $S3_BUCKET/$PREFIX"
 
 # заливаем RUNS копий, запоминая ключ каждого прогона
 i=1
