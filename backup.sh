@@ -92,18 +92,25 @@ export RCLONE_CONFIG_S3_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:?нужен S3_ACCESS_
 export RCLONE_CONFIG_S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:?нужен S3_SECRET_ACCESS_KEY}"
 export RCLONE_CONFIG_S3_REGION="$S3_REGION"
 [ -n "$S3_ENDPOINT" ] && export RCLONE_CONFIG_S3_ENDPOINT="$S3_ENDPOINT"
-RCLONE_OPTS="--s3-upload-concurrency 4 --stats=15s --stats-one-line -v"
+RCLONE_OPTS="--s3-upload-concurrency 4 --timeout 15m --retries 5 --low-level-retries 25 --stats=15s --stats-one-line -v"
 S3R="s3"   # имя remote; должно совпадать с префиксом RCLONE_CONFIG_<NAME>_* выше
 s3path() { printf '%s:%s/%s' "$S3R" "$S3_BUCKET" "$1"; }   # $1 = путь внутри бакета
 # Бакет НЕ создаём: он уже есть, объекты пишутся в подпапки (префиксы).
 
-# запуск rclone: вывод (прогресс/события) идёт в лог, код возврата — в RCLONE_RC
+# запуск rclone: вывод (прогресс/события) идёт в лог, код возврата — в RCLONE_RC.
+# Сторожевой таймаут попытки: 15 минут минимум; для больших дампов растёт (~размер/300 КБ/с),
 RCLONE_RC=0
+RCLONE_EXTRA=""            # доп. флаги для одной конкретной попытки (см. ниже)
+RCLONE_KBPS_FLOOR=300
 rclone_run() {
   _rcf="$WORKDIR/.rclone.rc"; rm -f "$_rcf"
-  { rclone $RCLONE_OPTS "$@"; echo $? >"$_rcf"; } 2>&1 \
+  _sz=0; [ -n "${RCLONE_CAP_SRC:-}" ] && [ -f "$RCLONE_CAP_SRC" ] && _sz="$(wc -c <"$RCLONE_CAP_SRC")"
+  _cap=$(( _sz / 1024 / RCLONE_KBPS_FLOOR )); [ "$_cap" -lt 900 ] && _cap=900   # 900s = 15 мин
+  { timeout "$_cap" rclone $RCLONE_OPTS $RCLONE_EXTRA "$@"; echo $? >"$_rcf"; } 2>&1 \
     | while IFS= read -r _ln; do [ -n "$_ln" ] && log "    rclone| $_ln"; done
   RCLONE_RC="$(cat "$_rcf" 2>/dev/null || echo 1)"
+  RCLONE_EXTRA=""          # флаги действуют только на один вызов
+  [ "$RCLONE_RC" = "124" ] && log "    rclone| передача прервана сторожем (медленнее ${RCLONE_KBPS_FLOOR} КБ/с) через ${_cap}s"
   rm -f "$_rcf"
 }
 
@@ -276,6 +283,7 @@ while true; do
     gstat="$(cat "$gstat_f" 2>/dev/null || echo 1)"; rm -f "$gstat_f"
     if [ "$gstat" = "0" ] && [ "$gz" = "0" ]; then
       log "  размер globals: $(wc -c <"$gout") B"
+      RCLONE_CAP_SRC="$gout"
       rclone_run copy "$gout" "$(s3path "$S3_PREFIX/_globals/")"
       if [ "$RCLONE_RC" = "0" ]; then
         log "upload OK: $S3_PREFIX/_globals/$TS.sql.zst"; retain "$S3_PREFIX/_globals/"
@@ -367,7 +375,9 @@ while true; do
     up_ok=0
     attempt=1
     while [ "$attempt" -le 3 ]; do
-      log "  rclone copy: попытка $attempt/3"
+      RCLONE_EXTRA=""; [ "$attempt" = "3" ] && RCLONE_EXTRA="--s3-disable-http2"
+      log "  rclone copy: попытка $attempt/3${RCLONE_EXTRA:+ (HTTP/2 отключён)}"
+      RCLONE_CAP_SRC="$out"
       rclone_run copy "$out" "$(s3path "$S3_PREFIX/$db/")"
       [ "$RCLONE_RC" = "0" ] && { up_ok=1; break; }
       log "  WARN: попытка $attempt/3 не удалась (см. вывод rclone выше)"
