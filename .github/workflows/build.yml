@@ -1,0 +1,87 @@
+# CI в два этапа:
+#   1) test  — прогон тестового стенда (PostgreSQL 15/16/17/18 + S3-совместимое хранилище,
+#              бэкап -> восстановление -> сверка данных -> retention -> fault injection -> уведомления);
+#   2) build — сборка и пуш образа в ghcr.io, ТОЛЬКО если тесты прошли (needs: test).
+#
+# На PR образ только собирается (без пуша) — секреты/пакеты не затрагиваются.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Тесты (PG 15/16/17/18 + S3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Версии docker/compose
+        run: |
+          docker --version
+          docker compose version
+
+      - name: "Тестовый стенд: бэкап, восстановление, retention, faults, notify"
+        run: make test
+
+      - name: Сводка и логи runner (при падении)
+        if: failure()
+        run: |
+          docker compose -f docker-compose.test.yml ps -a || true
+          docker compose -f docker-compose.test.yml logs --no-color runner || true
+
+      - name: Очистка стенда
+        if: always()
+        run: make test-down || true
+
+  build:
+    name: Сборка и пуш образа (ghcr.io)
+    needs: test                       # образ собирается только при успешных тестах
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Метаданные (теги/метки)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+
+      - name: Build & push (на PR — только сборка)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

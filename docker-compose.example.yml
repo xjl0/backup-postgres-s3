@@ -1,0 +1,56 @@
+# Пример подключения готового образа бэкапа к любому стеку.
+# Достаточно сослаться на образ и задать переменные — весь код внутри образа.
+# Сервис должен быть в ОДНОЙ сети с БД (здесь `backend`), чтобы резолвился PGHOST.
+
+services:
+  pg-backup:
+    image: ghcr.io/xjl0/backup-postgres-s3:latest   # ← ваш приватный ghcr-образ
+    restart: unless-stopped                    # для compose; swarm использует deploy.restart_policy
+    environment:
+      # БД (хост = имя сервиса БД в сети)
+      PGHOST: "postgres-db"
+      PGPORT: "5432"
+      PGUSER: "postgres"                       # нужен CONNECT ко всем БД + чтение (проще суперюзер)
+      PGPASSWORD: "CHANGE_ME"
+      # S3
+      S3_BUCKET: "CHANGE_ME"
+      S3_PREFIX: "myapp"                       # префикс в бакете
+      S3_ENDPOINT: ""                          # пусто = AWS; иначе, напр. https://s3.kz-1.srvstorage.kz
+      AWS_ACCESS_KEY_ID: "CHANGE_ME"
+      AWS_SECRET_ACCESS_KEY: "CHANGE_ME"
+      AWS_DEFAULT_REGION: "us-east-1"          # для S3-совместимых — регион провайдера, напр. kz-1
+      # Поведение
+      KEEP: "7"                                # копий каждой базы
+      ZSTD_LEVEL: "9"                          # 6=быстро, 9=баланс, 19=плотнее/медленнее
+      INTERVAL: "86400"                        # секунд между прогонами
+      EXCLUDE_DBS: "postgres"
+      # Проверки целостности
+      VERIFY: "1"                              # zstd -t + pg_restore -l перед загрузкой
+      VERIFY_FULL: "0"                         # 1 = ещё и полное чтение архива (без БД), медленнее
+      VERIFY_REMOTE: "1"                       # сверка размера в S3 после загрузки
+      RESTORE_TEST: "0"                        # 1 = тест восстановления в скретч-БД (нужен CREATEDB)
+    # Альтернатива environment: — файл KEY=VALUE (окружение приоритетнее файла).
+    # Удобно в swarm, где stack-файл игнорирует env_file:.
+    # volumes:
+    #   - ./stack.env:/etc/pg-backup/env:ro
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      replicas: 1
+      restart_policy:
+        condition: any
+      resources:
+        reservations:
+          cpus: "0.2"
+          memory: "128M"
+        limits:
+          cpus: "1.0"
+          memory: "512M"
+    networks:
+      - backend
+
+networks:
+  backend:
+    external: true
+    name: backend-network     # ← имя вашей сети с БД

@@ -1,0 +1,133 @@
+# Тестовый стенд pg-s3-backup: несколько версий PostgreSQL + S3-совместимое хранилище.
+# Полностью локально, наружу ничего не уходит. Запуск: make test
+#
+#   pg15..pg18  — серверы PostgreSQL 15/16/17/18, у каждого свои данные (test/seed/pgXX)
+#                 с фичами именно этой версии (MERGE, SQL/JSON, JSON_TABLE, uuidv7, ...)
+#   s3          — S3-совместимый сервер (adobe/s3mock)
+#   s3-init     — создаёт бакет pg-backup-test и завершается
+#   runner      — образ pg-s3-backup (клиент PG18): по очереди бэкапит каждый сервер
+#                 и проверяет восстановление данных (test/run-all.sh, test/verify.sh)
+#
+# Смотреть процесс: make test-logs. Один прогон, затем контейнер выходит с кодом 0/1.
+#
+# Любой S3-совместимый сервис подойдёт: чтобы взять MinIO, замените образ s3 на
+# minio/minio (и s3-init на minio/mc с `mc mb --ignore-existing local/pg-backup-test`).
+
+name: pg-s3-backup-test          # фиксируем имя проекта: сеть pg-s3-backup-test_testnet
+
+x-postgres: &postgres-base
+  environment:
+    POSTGRES_PASSWORD: postgres
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U postgres"]
+    interval: 2s
+    timeout: 3s
+    retries: 60
+  networks: [testnet]
+
+services:
+  pg15:
+    <<: *postgres-base
+    image: postgres:15-alpine
+    volumes:
+      - ./test/seed/pg15:/docker-entrypoint-initdb.d:ro
+      - pgdata15:/var/lib/postgresql/data
+
+  pg16:
+    <<: *postgres-base
+    image: postgres:16-alpine
+    volumes:
+      - ./test/seed/pg16:/docker-entrypoint-initdb.d:ro
+      - pgdata16:/var/lib/postgresql/data
+
+  pg17:
+    <<: *postgres-base
+    image: postgres:17-alpine
+    volumes:
+      - ./test/seed/pg17:/docker-entrypoint-initdb.d:ro
+      - pgdata17:/var/lib/postgresql/data
+
+  pg18:
+    <<: *postgres-base
+    image: postgres:18-alpine
+    volumes:
+      - ./test/seed/pg18:/docker-entrypoint-initdb.d:ro
+      - pgdata18:/var/lib/postgresql        # PG18+: том на /var/lib/postgresql, не .../data
+
+  s3:
+    image: adobe/s3mock:latest
+    stop_grace_period: 0s                   # не даём JVM печатать дамп памяти при остановке
+    networks: [testnet]
+
+  s3-init:
+    image: amazon/aws-cli:latest
+    depends_on: [s3]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        EP="--endpoint-url http://s3:9090"
+        until aws $$EP s3api list-buckets >/dev/null 2>&1; do sleep 1; done
+        aws $$EP s3api create-bucket --bucket pg-backup-test >/dev/null 2>&1 || true
+        echo "S3 готов, бакет pg-backup-test создан"
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    networks: [testnet]
+
+  runner:
+    image: pg-s3-backup-test-runner       # фиксированный тег: удобно запускать docker run-ом
+    build:
+      context: .
+      args:
+        PG_MAJOR: "18"                      # клиент pg_dump 18 снимает серверы 15..18
+    depends_on:
+      pg15:    {condition: service_healthy}
+      pg16:    {condition: service_healthy}
+      pg17:    {condition: service_healthy}
+      pg18:    {condition: service_healthy}
+      s3-init: {condition: service_completed_successfully}
+    entrypoint: ["/bin/sh", "/run-all.sh"]
+    environment:
+      # БД (PGHOST подставляется по версии в run-all.sh)
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      ADMIN_DB: postgres
+      # S3 = локальный стенд
+      S3_BUCKET: pg-backup-test
+      S3_ENDPOINT: http://s3:9090
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      # максимально строгий режим проверок
+      VERIFY: "1"
+      VERIFY_FULL: "1"
+      VERIFY_DOWNLOAD: "0"      # 0 = не скачивать объект из S3 (исходящий трафик)
+      # S3_CHECKSUM_ALGORITHM намеренно не задан — стенд проверяет значение по умолчанию
+      VERIFY_REMOTE: "1"
+      RESTORE_TEST: "1"
+      DUMP_GLOBALS: "1"
+      KEEP: "3"
+      KEEP_CHECK: "2"        # retention-проверка: сколько копий оставлять (RUNS > KEEP_CHECK)
+      KEEP_RUNS: "5"         # retention-проверка: сколько раз залить
+      ZSTD_LEVEL: "6"
+      INTERVAL: "1"
+      RUN_ONCE: "1"
+      WAIT_DB_TIMEOUT: "180"
+    volumes:
+      - ./test/run-all.sh:/run-all.sh:ro
+      - ./test/verify.sh:/verify.sh:ro
+      - ./test/retention.sh:/retention.sh:ro
+      - ./test/faults.sh:/faults.sh:ro
+      - ./test/notify.sh:/notify.sh:ro
+      - ./test/checks:/checks:ro
+    networks: [testnet]
+
+volumes:
+  pgdata15:
+  pgdata16:
+  pgdata17:
+  pgdata18:
+
+networks:
+  testnet:

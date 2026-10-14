@@ -1,0 +1,6 @@
+# креды/окружение
+.env
+stack.env
+*.pem
+*.key
+.idea
