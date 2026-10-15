@@ -79,8 +79,9 @@
 ## Команды
 
 ```bash
-make build IMAGE=ghcr.io/<OWNER>/pg-s3-backup [PG_MAJOR=16]   # сборка
-make push  IMAGE=ghcr.io/<OWNER>/pg-s3-backup                 # сборка + push
+make build IMAGE=xjl00/backup-postgres-s3 [PG_MAJOR=16]      # сборка (по умолчанию Docker Hub)
+make push  IMAGE=xjl00/backup-postgres-s3                    # сборка + push в Docker Hub
+make push-all                                                # сборка + push в Docker Hub и ghcr.io
 make run                                                      # локальный запуск из stack.env
 # стенд (PG 15/16/17/18 + S3, локально): бэкап + проверка восстановления данных
 make test                                                     # поднять стенд и прогнать

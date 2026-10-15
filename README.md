@@ -11,7 +11,7 @@ docker-compose.example.yml      # как подключить: только imag
 stack.env.example               # пример env-файла (KEY=VALUE), см. «Env-файл»
 docker-compose.test.yml         # локальный стенд: PG 15/16/17/18 + S3, см. «Тесты»
 test/                           # сиды по версиям, проверки восстановления, прогон
-.github/workflows/build.yml     # CI: тесты (PG 15..18) -> сборка и пуш образа в ghcr.io
+.github/workflows/build.yml     # CI: тесты (PG 15..18) -> сборка и пуш образа (Docker Hub + ghcr.io)
 Makefile                        # локальные build/push и test-* цели
 AGENTS.md                       # краткая карта репозитория для агентов/разработчиков
 ```
@@ -28,13 +28,37 @@ AGENTS.md                       # краткая карта репозитори
 
 ## Сборка образа
 Через CI (2 этапа, `.github/workflows/build.yml`): job **test** прогоняет весь стенд (PG 15/16/17/18 +
-S3), и только при успехе job **build** собирает и пушит `ghcr.io/xjl0/backup-postgres-s3` (пакет
-сделать приватным в настройках репозитория/пакета). На PR образ только собирается, без пуша.
+S3), и только при успехе job **build** собирает и пушит образ сразу в два реестра:
+
+| Реестр | Образ | Авторизация при push |
+|---|---|---|
+| Docker Hub | `xjl00/backup-postgres-s3` | секреты `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` |
+| ghcr.io | `ghcr.io/xjl0/backup-postgres-s3` | штатный `GITHUB_TOKEN` (секретов не нужно) |
+
+Образы **публичные** — `docker pull` работает без авторизации. Но **push в Docker Hub требует токена
+даже для публичного репозитория**: анонимный push Hub не принимает. Один раз заведите секреты
+репозитория (Settings → Secrets and variables → Actions):
+
+- `DOCKERHUB_USERNAME` — ник на Docker Hub (`xjl00`);
+- `DOCKERHUB_TOKEN` — Access Token из Hub (Account settings → Personal access tokens) с правом
+  **Read & Write**. Обычный пароль не подойдёт: у аккаунтов с 2FA вход по паролю отключён.
+
+> **Про публичность.** В Docker Hub репозиторий создаётся автоматически при первом push и сразу
+> публичный. А вот пакет в ghcr.io первый push через `GITHUB_TOKEN` создаёт **приватным** — для
+> анонимного `docker pull` один раз переключите: репозиторий → Packages → пакет → Package settings →
+> Change visibility → Public (либо привязать пакет к репозиторию в настройках пакета).
+
+Собирается только под `linux/amd64`. На PR образ только собирается, без пуша.
+
 Локально:
 ```bash
-make build IMAGE=ghcr.io/xjl0/backup-postgres-s3
-make push  IMAGE=ghcr.io/xjl0/backup-postgres-s3
+make build                      # сборка в xjl00/backup-postgres-s3:latest
+make push                       # сборка + push в Docker Hub
+make push-all                   # сборка + push в Docker Hub и ghcr.io
+make build IMAGE=ghcr.io/xjl0/backup-postgres-s3   # свой тег/реестр
 ```
+Перед `make push*` нужен логин: `docker login` (Docker Hub) и/или `docker login ghcr.io -u <user>`
+(в качестве пароля — токен).
 
 > **Версии.** Клиент `pg_dump` должен быть **>= сервера**. `pg_dump` умеет дампить серверы
 > **старее** себя (вплоть до 9.2), но **не новее**. Поэтому образ по умолчанию — с клиентом **PG18**,
@@ -100,7 +124,7 @@ make test-real-s3 REAL_PREFIX=test/mycheck REAL_KEEP=2
 ```yaml
 services:
   pg-backup:
-    image: ghcr.io/xjl0/backup-postgres-s3:latest
+    image: xjl00/backup-postgres-s3:latest   # зеркало: ghcr.io/xjl0/backup-postgres-s3
     restart: unless-stopped
     environment:
       PGHOST: "postgres-db"          # имя сервиса БД в сети

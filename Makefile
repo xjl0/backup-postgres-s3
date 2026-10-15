@@ -1,7 +1,11 @@
 # Локальная сборка/пуш образа (альтернатива CI).
-IMAGE    ?= ghcr.io/xjl0/backup-postgres-s3
-TAG      ?= latest
-PG_MAJOR ?= 18        # клиент pg_dump: должен быть >= сервера (18 снимает 15..18)
+# Docker Hub — основной реестр; ghcr.io — зеркало (target push-all).
+# ВАЖНО: комментарий к этим переменным — ОТДЕЛЬНОЙ строкой: make сохраняет пробелы перед `#`,
+# поэтому `IMAGE ?= foo   # коммент` дал бы значение "foo   " и сломало `-t $(IMAGE):$(TAG)`.
+IMAGE      ?= xjl00/backup-postgres-s3
+GHCR_IMAGE ?= ghcr.io/xjl0/backup-postgres-s3
+TAG        ?= latest
+PG_MAJOR   ?= 18        # клиент pg_dump: должен быть >= сервера (18 снимает 15..18)
 TEST_COMPOSE ?= docker-compose.test.yml
 TEST_IMAGE ?= pg-s3-backup-test-runner
 TEST_NET   ?= pg-s3-backup-test_testnet
@@ -14,12 +18,18 @@ DB       ?= app
 KEEP_CHECK ?= 2       # retention: сколько копий оставлять
 KEEP_RUNS  ?= 5       # retention: сколько копий залить
 
-.PHONY: build push run logs runner-image test test-up test-logs test-ls test-verify test-retention test-faults test-real-s3 test-down
+.PHONY: build push push-all run logs runner-image test test-up test-logs test-ls test-verify test-retention test-faults test-real-s3 test-down
 
 build:
 	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -t $(IMAGE):$(TAG) .
 push: build
 	docker push $(IMAGE):$(TAG)
+# push в оба реестра: Docker Hub ($(IMAGE)) + ghcr.io ($(GHCR_IMAGE))
+# логин заранее: `docker login` (Docker Hub) и `docker login ghcr.io -u <user>` (ghcr — токен как пароль)
+push-all: build
+	docker tag $(IMAGE):$(TAG) $(GHCR_IMAGE):$(TAG)
+	docker push $(IMAGE):$(TAG)
+	docker push $(GHCR_IMAGE):$(TAG)
 run:
 	docker run --rm --env-file ./stack.env $(IMAGE):$(TAG)
 logs:

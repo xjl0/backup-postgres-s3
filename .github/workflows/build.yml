@@ -1,9 +1,17 @@
 # CI в два этапа:
 #   1) test  — прогон тестового стенда (PostgreSQL 15/16/17/18 + S3-совместимое хранилище,
 #              бэкап -> восстановление -> сверка данных -> retention -> fault injection -> уведомления);
-#   2) build — сборка и пуш образа в ghcr.io, ТОЛЬКО если тесты прошли (needs: test).
+#   2) build — сборка и пуш образа в Docker Hub (xjl00/backup-postgres-s3) и ghcr.io,
+#              ТОЛЬКО если тесты прошли (needs: test).
 #
 # На PR образ только собирается (без пуша) — секреты/пакеты не затрагиваются.
+#
+# Секреты репозитория (Settings -> Secrets and variables -> Actions):
+#   DOCKERHUB_USERNAME — ник на Docker Hub;
+#   DOCKERHUB_TOKEN    — Access Token с правом Read & Write (Hub -> Account settings ->
+#                        Personal access tokens). Публичность образа НЕ отменяет авторизацию:
+#                        Docker Hub не принимает анонимный push даже в публичный репозиторий.
+# ghcr.io пушится штатным GITHUB_TOKEN (packages: write) — отдельных секретов не нужно.
 name: ci
 
 on:
@@ -46,7 +54,7 @@ jobs:
         run: make test-down || true
 
   build:
-    name: Сборка и пуш образа (ghcr.io)
+    name: Сборка и пуш образа (Docker Hub + ghcr.io)
     needs: test                       # образ собирается только при успешных тестах
     runs-on: ubuntu-latest
     permissions:
@@ -65,11 +73,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Метаданные (теги/метки)
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          # теги/метки генерируются одинаковые и применяются к обоим реестрам
+          images: |
+            xjl00/backup-postgres-s3
+            ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
@@ -80,6 +99,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
