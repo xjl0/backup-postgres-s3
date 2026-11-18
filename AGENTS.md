@@ -12,7 +12,7 @@
 
 | Файл | Роль |
 |---|---|
-| `backup.sh` | **Вся логика.** Цикл `while true`: перечислить базы → `pg_dump -Fd -j -Z zstd:N` → `verify` → `rclone copy` папки → `rclone check` → `MANIFEST.sha256` → `retain` → `sleep INTERVAL` |
+| `backup.sh` | **Вся логика.** Цикл `while true`: перечислить базы → `pg_dump -Fd -j -Z zstd:N` → `verify` → `rclone copy` папки (multipart) → `MANIFEST.sha256` → `retain` → `sleep INTERVAL` |
 | `Dockerfile` | `postgres:${PG_MAJOR}-alpine` + `rclone` + `zstd` + `curl`; `USER postgres`; ENTRYPOINT — скрипт. `ARG PG_MAJOR=18` |
 | `docker-compose.example.yml` | Пример подключения (только `image` + `environment`), сервис в одной сети с БД |
 | `stack.env.example` | Шаблон env-файла (`KEY=VALUE`); `cp stack.env.example stack.env` (последний в `.gitignore`) |
@@ -43,7 +43,7 @@
    - `verify_archive()`: `pg_restore -l` + `zstd -t` каждого файла, при `VERIFY_FULL=1` ещё `pg_restore -f /dev/null`;
    - при `RESTORE_TEST=1` — восстановление папки в скретч-БД `restore_test_*` и `dropdb` (нужен `CREATEDB`/суперюзер);
    - `MANIFEST.sha256` локально → `rclone copy` папки (без манифеста) в `S3_PREFIX/<db>/<UTC>/` →
-     при `VERIFY_REMOTE=1` `rclone check` (список/размеры/MD5 без скачивания) → манифест последним;
+     манифест последним (только при rc=0 загрузки);
      при провале — `rclone purge` неполной папки;
    - `retain()` — копии = папки с манифестом (+ одиночные файлы прежнего формата); оставляет `KEEP`
      новейших, остальные удаляет (`purge`/`deletefile`); папки без манифеста (кроме текущего TS) удаляет.
@@ -53,16 +53,16 @@
 
 - Язык комментариев/логов/доков — **русский**; сообщения скрипта в stdout → `docker logs`.
 - **S3 — только через `rclone`**, минимум сущностей: `rclone lsf` (список), `rclone copy`/`copyto`
-  (загрузка/скачивание), `rclone check` (сверка без скачивания), `rclone purge`/`deletefile` (retention). Потоки загрузки — всегда 4, остальное по
+  (загрузка/скачивание), `rclone purge`/`deletefile` (retention). Потоки загрузки — всегда 4, остальное по
   умолчанию rclone. Подключение — из переменных окружения (`S3_ENDPOINT`/`S3_REGION`/ключи), файла
   конфигурации нет. Бакет уже существует — скрипт его НЕ создаёт.
-- **Данные из S3 по умолчанию НЕ выкачиваются**: `VERIFY_FULL=1` (локально) + `VERIFY_REMOTE=1`
-  (`rclone check` по метаданным). Полное скачивание — только `VERIFY_DOWNLOAD=1`.
+- **Данные из S3 по умолчанию НЕ выкачиваются**: `VERIFY_FULL=1` (локально) + код возврата rclone
+  (Content-MD5 частей + размер). Полное скачивание — только `VERIFY_DOWNLOAD=1`.
 - Надёжность загрузки — два уровня: **наши 3 попытки** (`rclone copy` заново, пауза 10 с) и
   **внутренние повторы rclone** (`--retries 5`, `--low-level-retries 25`, `--timeout 15m`).
   Плюс сторожевой таймаут попытки (минимум 15 мин, для крупных дампов ~размер/300 КБ/с).
   `--s3-disable-http2` добавляется только на 3-й (последней) попытке — через `RCLONE_EXTRA`
-  (у части S3-совместимых HTTP/2 подвешивает загрузку). После загрузки — сверка.
+  (у части S3-совместимых HTTP/2 подвешивает загрузку).
 - Переменные берутся из окружения **и** из `ENV_FILE` (`KEY=VALUE`, по умолчанию `/etc/pg-backup/env`);
   заданные в окружении имеют приоритет. Новую переменную документируй в `README.md`.
 - Правки — в `backup.sh`; помни, что это POSIX `sh`, а не bash.
@@ -70,6 +70,9 @@
   `pg_restore` читает папку напрямую. Сжатие однопоточное (pg_dump не поддерживает `workers`), поэтому
   дефолт `ZSTD_LEVEL=3` (замер на 6,7 ГБ: 3 → 17 с, 9 → 72 с, 15 → 586 с при разнице размера ≤5%).
 - `MANIFEST.sha256` загружается **последним** и служит маркером полной копии — не меняй порядок.
+- **Загрузка — единым способом: multipart для всех файлов** (`--s3-upload-cutoff 0 --multi-thread-streams 0`),
+  лимит 5 ТБ на файл. НЕ добавляй `rclone check` по MD5: у Servercore ETag multipart-объекта без «-N»,
+  rclone принимает его за MD5 и сверка ложно падает. И не переходи на один PUT — это лимит 5 ГБ на файл.
 - Код возврата `pg_dump` теперь прямой (конвейера нет); у `pg_dumpall | zstd` (globals) он по-прежнему
   пишется в отдельный файл. Падение pg_dump → нет загрузки — покрыто `test/faults.sh`, не сломай.
 - Проверки уровня `VERIFY` (`pg_restore -l` + `zstd -t`) НЕ ловят обрыв на границе zstd-фрейма:

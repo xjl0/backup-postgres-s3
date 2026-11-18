@@ -87,7 +87,6 @@ services:
       VERIFY: "1"
       VERIFY_FULL: "1"
       VERIFY_DOWNLOAD: "0"      # 0 = не скачивать объект из S3 (исходящий трафик)
-      VERIFY_REMOTE: "1"
       RESTORE_TEST: "1"
       DUMP_GLOBALS: "1"
       KEEP: "3"

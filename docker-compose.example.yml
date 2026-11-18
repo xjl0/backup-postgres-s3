@@ -28,7 +28,6 @@ services:
       # Проверки целостности
       VERIFY: "1"                              # pg_restore -l + zstd -t каждого файла перед загрузкой
       VERIFY_FULL: "1"                         # 1 = ещё и полное чтение архива (без БД), медленнее
-      VERIFY_REMOTE: "1"                       # rclone check: сверка копии в S3 без скачивания
       RESTORE_TEST: "0"                        # 1 = тест восстановления в скретч-БД (нужен CREATEDB)
     # Альтернатива environment: — файл KEY=VALUE (окружение приоритетнее файла).
     # Удобно в swarm, где stack-файл игнорирует env_file:.

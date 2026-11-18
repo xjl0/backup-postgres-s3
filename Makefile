@@ -80,7 +80,7 @@ test-real-s3: runner-image     # ПРОВЕРКА РЕАЛЬНОГО S3 из $(R
 	docker run --rm --network $(TEST_NET) --env-file $(REAL_ENV) \
 	  -e PGHOST=pg18 -e PGPORT=5432 -e PGUSER=postgres -e PGPASSWORD=postgres -e ADMIN_DB=postgres \
 	  -e S3_PREFIX=$(REAL_PREFIX) -e RUN_ONCE=1 -e INTERVAL=1 -e KEEP=$(REAL_KEEP) \
-	  -e DUMP_GLOBALS=1 -e VERIFY=1 -e VERIFY_FULL=1 -e VERIFY_REMOTE=1 -e VERIFY_DOWNLOAD=0 -e RESTORE_TEST=0 \
+	  -e DUMP_GLOBALS=1 -e VERIFY=1 -e VERIFY_FULL=1 -e VERIFY_DOWNLOAD=0 -e RESTORE_TEST=0 \
 	  -e PROBE_MB=$(REAL_PROBE_MB) \
 	  -v $(CURDIR)/test/reals3.sh:/reals3.sh:ro \
 	  --entrypoint /bin/sh $(TEST_IMAGE) /reals3.sh

@@ -45,11 +45,11 @@ for v in $VERSIONS; do
     log "PG$v: БЭКАП ЗАВЕРШИЛСЯ С ОШИБКАМИ"; fail=1
   fi
 
-  # копия в S3 должна быть сверена БЕЗ скачивания (rclone check: список, размеры, MD5)
-  if grep -q 'копия в S3 сверена' "/tmp/backup-$v.log"; then
-    log "PG$v: копия в S3 сверена без скачивания (rclone check)"
+  # копия должна быть загружена целиком (манифест кладётся последним, только после успешной загрузки)
+  if grep -q 'upload OK: .*MANIFEST.sha256' "/tmp/backup-$v.log"; then
+    log "PG$v: копия загружена целиком (с MANIFEST.sha256)"
   else
-    log "PG$v: FAIL — в логе нет подтверждения проверки объекта в S3"; fail=1
+    log "PG$v: FAIL — в логе нет подтверждения полной загрузки копии"; fail=1
   fi
 
   if PGHOST="pg$v" S3_PREFIX="test/pg$v" sh /verify.sh "pg$v" app; then

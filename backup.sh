@@ -1,6 +1,6 @@
 #!/bin/sh
 # Логический бэкап всех баз PostgreSQL -> pg_dump directory-формат (каждая таблица = свой zstd-файл)
-# -> S3 папкой <prefix>/<db>/<UTC>/ (+ проверка целостности, сверка с S3 без скачивания).
+# -> S3 папкой <prefix>/<db>/<UTC>/ (+ локальная проверка целостности до загрузки).
 # Для docker-compose / docker swarm. Цикл раз в INTERVAL секунд.
 #
 # Версии: клиент pg_dump должен быть >= сервера. Один образ с клиентом PG18 снимает серверы
@@ -75,7 +75,6 @@ DUMP_GLOBALS="${DUMP_GLOBALS:-1}"
 VERIFY="${VERIFY:-1}"            # zstd -t + pg_restore -l (оглавление) перед загрузкой
 VERIFY_FULL="${VERIFY_FULL:-1}"  # + полное чтение архива (pg_restore -f /dev/null) — ловит обрыв данных.
                                  # Локально, без исходящего трафика; VERIFY_FULL=0 — быстрее, но слабее.
-VERIFY_REMOTE="${VERIFY_REMOTE:-1}"      # сверка копии в S3 без скачивания (rclone check: список, размеры, MD5)
 VERIFY_DOWNLOAD="${VERIFY_DOWNLOAD:-0}"  # 1 = дополнительно СКАЧАТЬ копию и проверить целиком (это трафик!)
 RESTORE_TEST="${RESTORE_TEST:-0}"
 
@@ -96,7 +95,11 @@ export RCLONE_CONFIG_S3_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:?нужен S3_ACCESS_
 export RCLONE_CONFIG_S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:?нужен S3_SECRET_ACCESS_KEY}"
 export RCLONE_CONFIG_S3_REGION="$S3_REGION"
 [ -n "$S3_ENDPOINT" ] && export RCLONE_CONFIG_S3_ENDPOINT="$S3_ENDPOINT"
-RCLONE_OPTS="--s3-upload-concurrency 4 --transfers $UPLOAD_TRANSFERS --timeout 15m --retries 5 --low-level-retries 25 --stats=15s --stats-one-line -v"
+# Единый способ загрузки: ВСЕ файлы multipart (--s3-upload-cutoff 0, без multi-thread) — лимит 5 ТБ на файл.
+# Целостность гарантирует сам rclone: Content-MD5 каждой части (S3 отклоняет битую часть) + сверка размера
+# после загрузки; любой незагруженный файл = ненулевой код rclone. Отдельной сверки (rclone check) нет:
+# у части S3-совместимых хранилищ (Servercore) ETag multipart-объекта не равен MD5, и сверка по MD5 ложно падает.
+RCLONE_OPTS="--s3-upload-cutoff 0 --multi-thread-streams 0 --s3-upload-concurrency 4 --transfers $UPLOAD_TRANSFERS --timeout 15m --retries 5 --low-level-retries 25 --stats=15s --stats-one-line -v"
 S3R="s3"   # имя remote; должно совпадать с префиксом RCLONE_CONFIG_<NAME>_* выше
 s3path() { printf '%s:%s/%s' "$S3R" "$S3_BUCKET" "$1"; }   # $1 = путь внутри бакета
 # Бакет НЕ создаём: он уже есть, объекты пишутся в подпапки (префиксы).
@@ -140,7 +143,7 @@ log "--- конфигурация ---"
 log "  БД:        PGHOST=$PGHOST PGPORT=$PGPORT PGUSER=$PGUSER ADMIN_DB=$ADMIN_DB (PGPASSWORD=***)"
 log "  S3:        bucket=$S3_BUCKET prefix=$S3_PREFIX provider=$RCLONE_CONFIG_S3_PROVIDER region=$S3_REGION endpoint=${S3_ENDPOINT:-<AWS>}"
 log "  режим:     KEEP=$KEEP ZSTD_LEVEL=$ZSTD_LEVEL DUMP_JOBS=$DUMP_JOBS UPLOAD_TRANSFERS=$UPLOAD_TRANSFERS INTERVAL=${INTERVAL}s RUN_ONCE=$RUN_ONCE EXCLUDE_DBS='$EXCLUDE_DBS' DUMP_GLOBALS=$DUMP_GLOBALS"
-log "  проверки:  VERIFY=$VERIFY VERIFY_FULL=$VERIFY_FULL VERIFY_REMOTE=$VERIFY_REMOTE VERIFY_DOWNLOAD=$VERIFY_DOWNLOAD RESTORE_TEST=$RESTORE_TEST"
+log "  проверки:  VERIFY=$VERIFY VERIFY_FULL=$VERIFY_FULL VERIFY_DOWNLOAD=$VERIFY_DOWNLOAD RESTORE_TEST=$RESTORE_TEST"
 log "  прочее:    WORKDIR=$WORKDIR WAIT_DB_TIMEOUT=${WAIT_DB_TIMEOUT}s EXTRA_PGDUMP_ARGS='$EXTRA_PGDUMP_ARGS' ENV_FILE=$ENV_FILE"
 
 # версия клиента (одна на весь прогон)
@@ -204,21 +207,6 @@ verify_archive() {
   fi
   log "  verify: OK"
   return 0
-}
-
-# Сверка копии в S3 БЕЗ скачивания: rclone check сравнивает список файлов, размеры и MD5
-# из метаданных объектов (листинг/HEAD; для multipart rclone хранит MD5 в метаданных сам).
-# Ловит недостающие, лишние и битые файлы. Исходящего трафика нет.
-verify_remote_copy() {
-  d="$1"; key="$2"   # key = папка-в-бакете без слэша
-  _chk="$(rclone check --exclude "$MANIFEST" --retries 3 "$d" "$(s3path "$key/")" 2>&1)"; _crc=$?
-  printf '%s\n' "$_chk" | grep -E 'ERROR|differences|matching|hash' | while IFS= read -r _l; do log "    check| $_l"; done
-  if [ "$_crc" = "0" ]; then
-    log "  копия в S3 сверена: $(ls "$d" | grep -vc "^$MANIFEST\$") файлов (без скачивания)"
-    return 0
-  fi
-  log "  ERROR: сверка копии в S3 не прошла (rclone check rc=$_crc)"
-  return 1
 }
 
 # --- ждём БД, определяем версию сервера и права ---
@@ -387,8 +375,8 @@ while true; do
       log "ERROR: не удалось посчитать манифест: $db"; FAILED=1; rm -rf "$out"; continue
     fi
 
-    # Копия = папка <prefix>/<db>/<TS>/: 1) файлы дампа (rclone copy, повторы докачивают недостающее)
-    # 2) сверка с S3 без скачивания 3) манифест ПОСЛЕДНИМ — без него копия считается неполной.
+    # Копия = папка <prefix>/<db>/<TS>/: 1) файлы дампа (rclone copy multipart; rc=0 = всё загружено,
+    # повторы докачивают недостающее) 2) манифест ПОСЛЕДНИМ — без него копия считается неполной.
     key="$S3_PREFIX/$db/$TS"
     log "  загрузка: $out/ -> $S3_BUCKET/$key/ ($nfiles файлов, по $UPLOAD_TRANSFERS параллельно)"
     up_ok=0
@@ -406,9 +394,6 @@ while true; do
         sleep 10
       fi
     done
-    if [ "$up_ok" = "1" ] && [ "$VERIFY_REMOTE" = "1" ]; then
-      verify_remote_copy "$out" "$key" || up_ok=0
-    fi
     if [ "$up_ok" = "1" ]; then
       RCLONE_CAP_SRC="$out/$MANIFEST"
       rclone_run copyto "$out/$MANIFEST" "$(s3path "$key/$MANIFEST")"

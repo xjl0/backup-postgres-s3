@@ -73,14 +73,14 @@ fi
 # --- 3) реальный прогон backup.sh ---
 log "прогон backup.sh (PGHOST=$PGHOST) в префикс $S3_PREFIX ..."
 PGHOST="$PGHOST" S3_PREFIX="$S3_PREFIX" RUN_ONCE=1 INTERVAL=1 KEEP="${KEEP:-3}" \
-  VERIFY=1 VERIFY_FULL=1 VERIFY_REMOTE=1 VERIFY_DOWNLOAD=0 RESTORE_TEST=0 DUMP_GLOBALS=1 \
+  VERIFY=1 VERIFY_FULL=1 VERIFY_DOWNLOAD=0 RESTORE_TEST=0 DUMP_GLOBALS=1 \
   sh /usr/local/bin/backup.sh > /tmp/reals3-backup.log 2>&1
 rc=$?
 sed 's/^/        /' /tmp/reals3-backup.log
-if [ "$rc" = "0" ] && grep -q 'копия в S3 сверена' /tmp/reals3-backup.log; then
+if [ "$rc" = "0" ] && grep -q 'upload OK: .*MANIFEST.sha256' /tmp/reals3-backup.log; then
   ok "backup.sh: выгрузка и проверка объекта без скачивания прошли"
 else
-  bad "backup.sh завершился с кодом $rc или объект не сверен"
+  bad "backup.sh завершился с кодом $rc или копия не загружена целиком"
 fi
 
 # --- 4) list/delete ---
