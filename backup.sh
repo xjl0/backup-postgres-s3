@@ -1,5 +1,6 @@
 #!/bin/sh
-# Логический бэкап всех баз PostgreSQL -> zstd -> S3 (+ проверка целостности).
+# Логический бэкап всех баз PostgreSQL -> pg_dump directory-формат (каждая таблица = свой zstd-файл)
+# -> S3 папкой <prefix>/<db>/<UTC>/ (+ проверка целостности, сверка с S3 без скачивания).
 # Для docker-compose / docker swarm. Цикл раз в INTERVAL секунд.
 #
 # Версии: клиент pg_dump должен быть >= сервера. Один образ с клиентом PG18 снимает серверы
@@ -62,7 +63,10 @@ S3_REGION="${S3_REGION:-us-east-1}"
 S3_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-}}"
 S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-}}"
 KEEP="${KEEP:-7}"
-ZSTD_LEVEL="${ZSTD_LEVEL:-9}"
+ZSTD_LEVEL="${ZSTD_LEVEL:-3}"     # pg_dump -Z zstd:N; 3 ≈ в 4 раза быстрее 9 при +~4% к размеру
+DUMP_JOBS="${DUMP_JOBS:-2}"       # pg_dump -j: таблиц параллельно (соединений к БД = N+1)
+UPLOAD_TRANSFERS="${UPLOAD_TRANSFERS:-4}"   # файлов копии параллельно при загрузке в S3
+MANIFEST="MANIFEST.sha256"        # кладётся в папку копии ПОСЛЕДНИМ = маркер полной копии
 INTERVAL="${INTERVAL:-86400}"
 EXCLUDE_DBS="${EXCLUDE_DBS:-postgres}"
 DUMP_GLOBALS="${DUMP_GLOBALS:-1}"
@@ -71,8 +75,8 @@ DUMP_GLOBALS="${DUMP_GLOBALS:-1}"
 VERIFY="${VERIFY:-1}"            # zstd -t + pg_restore -l (оглавление) перед загрузкой
 VERIFY_FULL="${VERIFY_FULL:-1}"  # + полное чтение архива (pg_restore -f /dev/null) — ловит обрыв данных.
                                  # Локально, без исходящего трафика; VERIFY_FULL=0 — быстрее, но слабее.
-VERIFY_REMOTE="${VERIFY_REMOTE:-1}"      # проверка объекта в S3 без скачивания (сверка размера)
-VERIFY_DOWNLOAD="${VERIFY_DOWNLOAD:-0}"  # 1 = дополнительно СКАЧАТЬ объект и проверить целиком (это трафик!)
+VERIFY_REMOTE="${VERIFY_REMOTE:-1}"      # сверка копии в S3 без скачивания (rclone check: список, размеры, MD5)
+VERIFY_DOWNLOAD="${VERIFY_DOWNLOAD:-0}"  # 1 = дополнительно СКАЧАТЬ копию и проверить целиком (это трафик!)
 RESTORE_TEST="${RESTORE_TEST:-0}"
 
 # --- доп. флаги pg_dump (напр. --enable-row-security, --no-large-objects) ---
@@ -92,7 +96,7 @@ export RCLONE_CONFIG_S3_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:?нужен S3_ACCESS_
 export RCLONE_CONFIG_S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:?нужен S3_SECRET_ACCESS_KEY}"
 export RCLONE_CONFIG_S3_REGION="$S3_REGION"
 [ -n "$S3_ENDPOINT" ] && export RCLONE_CONFIG_S3_ENDPOINT="$S3_ENDPOINT"
-RCLONE_OPTS="--s3-upload-concurrency 4 --timeout 15m --retries 5 --low-level-retries 25 --stats=15s --stats-one-line -v"
+RCLONE_OPTS="--s3-upload-concurrency 4 --transfers $UPLOAD_TRANSFERS --timeout 15m --retries 5 --low-level-retries 25 --stats=15s --stats-one-line -v"
 S3R="s3"   # имя remote; должно совпадать с префиксом RCLONE_CONFIG_<NAME>_* выше
 s3path() { printf '%s:%s/%s' "$S3R" "$S3_BUCKET" "$1"; }   # $1 = путь внутри бакета
 # Бакет НЕ создаём: он уже есть, объекты пишутся в подпапки (префиксы).
@@ -104,7 +108,7 @@ RCLONE_EXTRA=""            # доп. флаги для одной конкрет
 RCLONE_KBPS_FLOOR=300
 rclone_run() {
   _rcf="$WORKDIR/.rclone.rc"; rm -f "$_rcf"
-  _sz=0; [ -n "${RCLONE_CAP_SRC:-}" ] && [ -f "$RCLONE_CAP_SRC" ] && _sz="$(wc -c <"$RCLONE_CAP_SRC")"
+  _sz=0; [ -n "${RCLONE_CAP_SRC:-}" ] && [ -e "$RCLONE_CAP_SRC" ] && _sz="$(du -sb "$RCLONE_CAP_SRC" | cut -f1)"
   _cap=$(( _sz / 1024 / RCLONE_KBPS_FLOOR )); [ "$_cap" -lt 900 ] && _cap=900   # 900s = 15 мин
   { timeout "$_cap" rclone $RCLONE_OPTS $RCLONE_EXTRA "$@"; echo $? >"$_rcf"; } 2>&1 \
     | while IFS= read -r _ln; do [ -n "$_ln" ] && log "    rclone| $_ln"; done
@@ -121,8 +125,11 @@ next_run() {
 }
 
 # --- инструменты ---
-command -v rclone >/dev/null 2>&1 || apk add --no-cache rclone >/dev/null 2>&1
-command -v zstd   >/dev/null 2>&1 || apk add --no-cache zstd   >/dev/null 2>&1
+# (в образе они уже есть; apk — только если скрипт запущен в голом postgres:*-alpine, с повторами)
+for _i in 1 2 3 4 5; do
+  command -v rclone >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1 && break
+  apk add --no-cache rclone zstd >/dev/null 2>&1 || { log "WARN: apk add rclone zstd: попытка $_i/5 не удалась"; sleep 15; }
+done
 command -v rclone >/dev/null 2>&1 || { log "FATAL: нет rclone"; exit 1; }
 command -v zstd   >/dev/null 2>&1 || { log "FATAL: нет zstd";   exit 1; }
 
@@ -132,80 +139,86 @@ mkdir -p "$WORKDIR"
 log "--- конфигурация ---"
 log "  БД:        PGHOST=$PGHOST PGPORT=$PGPORT PGUSER=$PGUSER ADMIN_DB=$ADMIN_DB (PGPASSWORD=***)"
 log "  S3:        bucket=$S3_BUCKET prefix=$S3_PREFIX provider=$RCLONE_CONFIG_S3_PROVIDER region=$S3_REGION endpoint=${S3_ENDPOINT:-<AWS>}"
-log "  режим:     KEEP=$KEEP ZSTD_LEVEL=$ZSTD_LEVEL INTERVAL=${INTERVAL}s RUN_ONCE=$RUN_ONCE EXCLUDE_DBS='$EXCLUDE_DBS' DUMP_GLOBALS=$DUMP_GLOBALS"
+log "  режим:     KEEP=$KEEP ZSTD_LEVEL=$ZSTD_LEVEL DUMP_JOBS=$DUMP_JOBS UPLOAD_TRANSFERS=$UPLOAD_TRANSFERS INTERVAL=${INTERVAL}s RUN_ONCE=$RUN_ONCE EXCLUDE_DBS='$EXCLUDE_DBS' DUMP_GLOBALS=$DUMP_GLOBALS"
 log "  проверки:  VERIFY=$VERIFY VERIFY_FULL=$VERIFY_FULL VERIFY_REMOTE=$VERIFY_REMOTE VERIFY_DOWNLOAD=$VERIFY_DOWNLOAD RESTORE_TEST=$RESTORE_TEST"
 log "  прочее:    WORKDIR=$WORKDIR WAIT_DB_TIMEOUT=${WAIT_DB_TIMEOUT}s EXTRA_PGDUMP_ARGS='$EXTRA_PGDUMP_ARGS' ENV_FILE=$ENV_FILE"
 
 # версия клиента (одна на весь прогон)
 CLIENT_MAJOR="$(pg_dump --version | sed -n 's/.* \([0-9][0-9]*\)\..*/\1/p')"
 [ -z "$CLIENT_MAJOR" ] && CLIENT_MAJOR=0
+if [ "$CLIENT_MAJOR" -lt 16 ]; then
+  log "FATAL: pg_dump $CLIENT_MAJOR не умеет -Z zstd (нужен клиент PG16+). Соберите образ с PG_MAJOR>=16 (по умолчанию 18)."
+  exit 1
+fi
 
 psqlA() { psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$ADMIN_DB" -At "$@"; }
 
+# retention: оставить KEEP свежих ПОЛНЫХ копий (имена = UTC-таймстамп -> сортировка = хронология).
+# Копия = папка <TS>/ с файлами дампа + MANIFEST.sha256 (текущий формат)
+#         или одиночный файл <TS>.dump.zst / <TS>.sql.zst (прежний формат — уходит по ретеншну сам).
+# Папка без манифеста = неполная (упавший/убитый прогон) — удаляется сразу (кроме текущего TS).
 retain() {
   prefix="$1"     # напр. "zooclub/app/" — путь внутри бакета
-  keys="$(rclone ls "$(s3path "$prefix")" 2>/dev/null | awk '{print $2}' | grep . | sort)"
-  [ -z "$keys" ] && { log "  retention $prefix: объектов нет"; return 0; }
+  _ls="$(rclone lsf -R --files-only --max-depth 2 "$(s3path "$prefix")" 2>/dev/null)" \
+    || { log "  retention $prefix: не удалось получить список — пропускаю"; return 0; }
+  [ -z "$_ls" ] && { log "  retention $prefix: объектов нет"; return 0; }
+  _dirs="$(printf '%s\n' "$_ls" | grep '/' | cut -d/ -f1 | sort -u)"
+  _done="$(printf '%s\n' "$_ls" | grep "/$MANIFEST\$" | cut -d/ -f1 | sort -u)"
+  for d in $_dirs; do
+    [ "$d" = "$TS" ] && continue
+    printf '%s\n' "$_done" | grep -qxF "$d" && continue
+    rclone purge "$(s3path "$prefix$d/")" >/dev/null 2>&1 && log "    удалена неполная копия $prefix$d/"
+  done
+  keys="$( { printf '%s\n' "$_ls" | grep -v '/'; printf '%s\n' "$_done" | sed '/./s|$|/|'; } | grep . | sort)"
+  [ -z "$keys" ] && { log "  retention $prefix: полных копий нет"; return 0; }
   count="$(printf '%s\n' "$keys" | grep -c .)"
   if [ "$count" -le "$KEEP" ]; then
-    log "  retention $prefix: $count объектов, удалять нечего (KEEP=$KEEP)"
+    log "  retention $prefix: $count копий, удалять нечего (KEEP=$KEEP)"
     return 0
   fi
   drop=$((count - KEEP))
-  log "  retention $prefix: $count объектов, удаляю $drop старейших (KEEP=$KEEP)"
+  log "  retention $prefix: $count копий, удаляю $drop старейших (KEEP=$KEEP)"
   printf '%s\n' "$keys" | head -n "$drop" | while IFS= read -r rel; do
-    [ -n "$rel" ] || continue
-    rclone deletefile "$(s3path "$prefix$rel")" >/dev/null 2>&1 && log "    удалён $prefix$rel"
+    case "$rel" in
+      '') ;;
+      */) rclone purge      "$(s3path "$prefix$rel")" >/dev/null 2>&1 && log "    удалена $prefix$rel" ;;
+      *)  rclone deletefile "$(s3path "$prefix$rel")" >/dev/null 2>&1 && log "    удалён $prefix$rel" ;;
+    esac
   done
 }
 
+# проверка копии в directory-формате: оглавление + каждый zstd-файл отдельно (+ полное чтение)
 verify_archive() {
-  f="$1"
-  log "  verify: zstd -t $f"
-  zstd -t "$f" >/dev/null 2>&1 || { log "  verify: zstd -t FAILED"; return 1; }
-  log "  verify: pg_restore -l (оглавление архива)"
-  unzstd -c "$f" | pg_restore -l >/dev/null 2>&1 || { log "  verify: pg_restore -l FAILED"; return 1; }
+  d="$1"
+  log "  verify: pg_restore -l (оглавление toc.dat)"
+  pg_restore -l "$d" >/dev/null 2>&1 || { log "  verify: pg_restore -l FAILED"; return 1; }
+  log "  verify: zstd -t каждого файла данных"
+  for z in "$d"/*.zst; do
+    [ -e "$z" ] || continue
+    zstd -q -t "$z" >/dev/null 2>&1 || { log "  verify: zstd -t FAILED: ${z##*/}"; return 1; }
+  done
   if [ "${VERIFY_FULL:-0}" = "1" ]; then
-    # полное чтение архива (читает все данные, но SQL никуда не исполняется) — БД/права не нужны.
-    # Локально, без обращения к S3 — это и есть проверка «дамп не сломан» до загрузки.
-    log "  verify: полное чтение архива (pg_restore -f /dev/null)"
-    unzstd -c "$f" | pg_restore -f /dev/null >/dev/null 2>&1 || { log "  verify: full read FAILED"; return 1; }
+    # полное чтение (все данные, SQL никуда не исполняется) — БД/права не нужны, трафика нет.
+    log "  verify: полное чтение копии (pg_restore -f /dev/null)"
+    pg_restore -f /dev/null "$d" >/dev/null 2>&1 || { log "  verify: full read FAILED"; return 1; }
   fi
   log "  verify: OK"
   return 0
 }
 
-# Проверка объекта в S3 БЕЗ скачивания: сверяем размер по `rclone ls`.
-# (MD5/ETag у multipart-объектов не равен MD5 файла, поэтому полагаемся на размер + локальную
-#  проверку архива до загрузки; VERIFY_DOWNLOAD=1 — опционально скачать и проверить целиком.)
-verify_remote_object() {
-  key="$1"; f="$2"
-  dir="${key%/*}/"; base="${key##*/}"
-  local_sz="$(wc -c <"$f")"
-
-  # 1) размер
-  remote_sz="$(rclone ls "$(s3path "$dir")" 2>/dev/null | awk -v b="$base" '$2==b {print $1; exit}')"
-  if [ "${remote_sz:-}" != "$local_sz" ]; then
-    log "  ERROR: размер в S3 (${remote_sz:-нет}) != локального ($local_sz)"; return 1
+# Сверка копии в S3 БЕЗ скачивания: rclone check сравнивает список файлов, размеры и MD5
+# из метаданных объектов (листинг/HEAD; для multipart rclone хранит MD5 в метаданных сам).
+# Ловит недостающие, лишние и битые файлы. Исходящего трафика нет.
+verify_remote_copy() {
+  d="$1"; key="$2"   # key = папка-в-бакете без слэша
+  _chk="$(rclone check --exclude "$MANIFEST" --retries 3 "$d" "$(s3path "$key/")" 2>&1)"; _crc=$?
+  printf '%s\n' "$_chk" | grep -E 'ERROR|differences|matching|hash' | while IFS= read -r _l; do log "    check| $_l"; done
+  if [ "$_crc" = "0" ]; then
+    log "  копия в S3 сверена: $(ls "$d" | grep -vc "^$MANIFEST\$") файлов (без скачивания)"
+    return 0
   fi
-  log "  размер в S3 сверен: $remote_sz B (без скачивания)"
-
-  # 2) MD5. В S3 ETag == MD5 только для объектов, загруженных одним запросом (не multipart).
-  # rclone грузит одним запросом всё, что меньше ~200 МиБ, поэтому сумму сверяем только для таких.
-  if [ "$local_sz" -lt 209715200 ]; then
-    remote_md5="$(rclone md5sum "$(s3path "$key")" 2>/dev/null | awk '{print $1}')"
-    if [ -n "$remote_md5" ]; then
-      local_md5="$(md5sum "$f" | cut -d' ' -f1)"
-      if [ "$remote_md5" = "$local_md5" ]; then
-        log "  MD5 сверен с S3 (без скачивания)"
-      else
-        log "  ERROR: MD5 в S3 ($remote_md5) != локального ($local_md5)"; return 1
-      fi
-    fi
-  else
-    log "  MD5 не сравниваем: объект ≥ 200 МиБ (multipart, ETag != MD5)"
-  fi
-  return 0
+  log "  ERROR: сверка копии в S3 не прошла (rclone check rc=$_crc)"
+  return 1
 }
 
 # --- ждём БД, определяем версию сервера и права ---
@@ -315,28 +328,27 @@ while true; do
     fi
 
     log "dump: $db (сервер ${SERVER_MAJOR}, клиент ${CLIENT_MAJOR}${CROSS:+, cross-version})"
-    log "  команда: pg_dump -Fc -Z0 $CROSS $EXTRA_PGDUMP_ARGS -d '$db' | zstd -$ZSTD_LEVEL"
+    log "  команда: pg_dump -Fd -j $DUMP_JOBS -Z zstd:$ZSTD_LEVEL $CROSS $EXTRA_PGDUMP_ARGS -d '$db'"
+    # directory-формат: toc.dat + по самостоятельному zstd-файлу на таблицу/blob.
+    # Код возврата pg_dump берём напрямую (конвейера нет) — оборванный дамп не уйдёт в S3.
     mkdir -p "$WORKDIR/$db"
-    out="$WORKDIR/$db/$TS.dump.zst"
-    dstat_f="$WORKDIR/.${db}.rc"; rm -f "$dstat_f"
+    out="$WORKDIR/$db/$TS"; rm -rf "$out"    # pg_dump -Fd требует несуществующую папку
     dump_t0="$(date +%s)"
-    # NB: в POSIX sh статус конвейера = статус последней команды (zstd), поэтому падение
-    # pg_dump отдельно пишем в файл: иначе оборванный дамп (валидное оглавление + часть
-    # данных) может пройти verify и уехать в S3 как «успешный».
-    zstat=0
-    { pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -Fc -Z0 $CROSS $EXTRA_PGDUMP_ARGS -d "$db"; echo $? > "$dstat_f"; } \
-        | zstd -q -"$ZSTD_LEVEL" -c > "$out" || zstat=$?
-    dstat="$(cat "$dstat_f" 2>/dev/null || echo 1)"; rm -f "$dstat_f"
-    if [ "$dstat" != "0" ] || [ "$zstat" != "0" ] || [ ! -s "$out" ]; then
-      log "ERROR: дамп не удался: pg_dump=$dstat, zstd=$zstat, размер $(wc -c <"$out" 2>/dev/null || echo 0) B — в S3 не загружаю"
-      FAILED=1; rm -f "$out"; continue
+    pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -Fd -j "$DUMP_JOBS" -Z "zstd:$ZSTD_LEVEL" \
+      $CROSS $EXTRA_PGDUMP_ARGS -d "$db" -f "$out"
+    dstat=$?
+    size="$(du -sb "$out" 2>/dev/null | cut -f1)"; size="${size:-0}"
+    if [ "$dstat" != "0" ] || [ ! -s "$out/toc.dat" ]; then
+      log "ERROR: дамп не удался: pg_dump=$dstat, размер $size B — в S3 не загружаю"
+      FAILED=1; rm -rf "$out"; continue
     fi
-    log "  размер дампа: $(wc -c <"$out") B (zstd -$ZSTD_LEVEL, за $(( $(date +%s) - dump_t0 ))s)"
+    nfiles="$(ls "$out" | grep -c .)"
+    log "  размер копии: $size B, файлов: $nfiles (zstd:$ZSTD_LEVEL, за $(( $(date +%s) - dump_t0 ))s)"
 
     if [ "$VERIFY" = "1" ]; then
       log "  проверка целостности: $db"
       if ! verify_archive "$out"; then
-        log "ERROR: проверка целостности не пройдена: $db"; FAILED=1; rm -f "$out"; continue
+        log "ERROR: проверка целостности не пройдена: $db"; FAILED=1; rm -rf "$out"; continue
       fi
     else
       log "  проверка целостности пропущена (VERIFY=0)"
@@ -348,8 +360,8 @@ while true; do
       errlog="$WORKDIR/restore_$db.err"
       log "  restore-test: создаю $scratch и восстанавливаю $db"
       if createdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$scratch" 2>/dev/null \
-         && unzstd -c "$out" | pg_restore -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$scratch" \
-              --no-owner --no-privileges 2>"$errlog"; then
+         && pg_restore -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$scratch" -j "$DUMP_JOBS" \
+              --no-owner --no-privileges "$out" 2>"$errlog"; then
         log "  restore-test OK: $db -> $scratch"
       else
         # кросс-версия: клиент новее сервера может слать SET для GUC, которых нет в старом сервере
@@ -370,15 +382,22 @@ while true; do
       log "  restore-test пропущен: нет CREATEDB/SUPERUSER или база postgres"
     fi
 
-    key="$S3_PREFIX/$db/$TS.dump.zst"
-    log "  загрузка: $out -> $S3_BUCKET/$key"
+    # манифест: sha256 каждого файла (после скачивания: sha256sum -c MANIFEST.sha256)
+    if ! (cd "$out" && sha256sum * > "../.$TS.manifest" && mv "../.$TS.manifest" "$MANIFEST"); then
+      log "ERROR: не удалось посчитать манифест: $db"; FAILED=1; rm -rf "$out"; continue
+    fi
+
+    # Копия = папка <prefix>/<db>/<TS>/: 1) файлы дампа (rclone copy, повторы докачивают недостающее)
+    # 2) сверка с S3 без скачивания 3) манифест ПОСЛЕДНИМ — без него копия считается неполной.
+    key="$S3_PREFIX/$db/$TS"
+    log "  загрузка: $out/ -> $S3_BUCKET/$key/ ($nfiles файлов, по $UPLOAD_TRANSFERS параллельно)"
     up_ok=0
     attempt=1
     while [ "$attempt" -le 3 ]; do
-      RCLONE_EXTRA=""; [ "$attempt" = "3" ] && RCLONE_EXTRA="--s3-disable-http2"
-      log "  rclone copy: попытка $attempt/3${RCLONE_EXTRA:+ (HTTP/2 отключён)}"
+      RCLONE_EXTRA="--exclude $MANIFEST"; [ "$attempt" = "3" ] && RCLONE_EXTRA="$RCLONE_EXTRA --s3-disable-http2"
+      log "  rclone copy: попытка $attempt/3${RCLONE_EXTRA##*$MANIFEST}"
       RCLONE_CAP_SRC="$out"
-      rclone_run copy "$out" "$(s3path "$S3_PREFIX/$db/")"
+      rclone_run copy "$out" "$(s3path "$key/")"
       [ "$RCLONE_RC" = "0" ] && { up_ok=1; break; }
       log "  WARN: попытка $attempt/3 не удалась (см. вывод rclone выше)"
       attempt=$((attempt + 1))
@@ -387,28 +406,34 @@ while true; do
         sleep 10
       fi
     done
+    if [ "$up_ok" = "1" ] && [ "$VERIFY_REMOTE" = "1" ]; then
+      verify_remote_copy "$out" "$key" || up_ok=0
+    fi
     if [ "$up_ok" = "1" ]; then
-      if [ "$VERIFY_REMOTE" = "1" ]; then
-        verify_remote_object "$key" "$out" || FAILED=1
-      else
-        log "upload OK: $key ($(wc -c <"$out") B; VERIFY_REMOTE=0 — без проверки в S3)"
-      fi
+      RCLONE_CAP_SRC="$out/$MANIFEST"
+      rclone_run copyto "$out/$MANIFEST" "$(s3path "$key/$MANIFEST")"
+      [ "$RCLONE_RC" = "0" ] || { log "  ERROR: манифест не загружен"; up_ok=0; }
+    fi
+    if [ "$up_ok" = "1" ]; then
+      log "upload OK: $key/ ($nfiles файлов + $MANIFEST)"
       if [ "$VERIFY_DOWNLOAD" = "1" ]; then
-        log "  VERIFY_DOWNLOAD=1: скачиваю объект и проверяю полностью (это исходящий трафик!)"
+        log "  VERIFY_DOWNLOAD=1: скачиваю копию и проверяю полностью (это исходящий трафик!)"
         rm -rf "$WORKDIR/_dl"; mkdir -p "$WORKDIR/_dl"
-        rclone_run copy "$(s3path "$key")" "$WORKDIR/_dl"
-        if [ "$RCLONE_RC" = "0" ] && verify_archive "$WORKDIR/_dl/$TS.dump.zst"; then
-          log "  скачанный из S3 объект цел"
+        rclone_run copy "$(s3path "$key/")" "$WORKDIR/_dl"
+        if [ "$RCLONE_RC" = "0" ] && (cd "$WORKDIR/_dl" && sha256sum -c -s "$MANIFEST") \
+           && verify_archive "$WORKDIR/_dl"; then
+          log "  скачанная из S3 копия цела (sha256 + pg_restore)"
         else
-          log "  ERROR: скачанный из S3 объект повреждён"; FAILED=1
+          log "  ERROR: скачанная из S3 копия повреждена"; FAILED=1
         fi
         rm -rf "$WORKDIR/_dl"
       fi
       retain "$S3_PREFIX/$db/"
     else
-      log "ERROR: upload failed: $db"; FAILED=1
+      log "ERROR: upload failed: $db — удаляю неполную копию $key/"; FAILED=1
+      rclone purge "$(s3path "$key/")" >/dev/null 2>&1
     fi
-    rm -f "$out"
+    rm -rf "$out"
     log "  БАЗА $db: готово за $(( $(date +%s) - db_t0 ))s"
   done
 

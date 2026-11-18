@@ -1,6 +1,6 @@
 #!/bin/sh
 # Проверка, что бэкап со стенда не только валиден, но и РАЗВОРАЧИВАЕТСЯ с сохранением данных:
-#   1) берём последний дамп базы из S3 (стенд), проверяем zstd/pg_restore -l;
+#   1) берём последнюю ПОЛНУЮ копию (папку с MANIFEST.sha256) из S3, проверяем sha256/zstd/pg_restore -l;
 #   2) восстанавливаем его в одноразовую БД на сервере ТОЙ ЖЕ версии;
 #   3) сверяем число строк по каждой таблице «источник vs восстановленная»;
 #   4) прогоняем версионную проверку /checks/<ver>.sql (фичи конкретного мажора).
@@ -36,31 +36,32 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# 1) последний объект под префиксом базы
-rel="$(s3_list "$S3_PREFIX/$DB/" | tail -n 1)"
-key=""
-[ -n "$rel" ] && key="$S3_PREFIX/$DB/$rel"
-if [ -z "$key" ]; then
-  log "ОШИБКА: нет объектов s3://$S3_BUCKET/$S3_PREFIX/$DB/"; exit 1
+# 1) последняя полная копия = последняя папка <TS>/ с MANIFEST.sha256
+rel="$(rclone lsf -R --files-only --max-depth 2 "$(s3path "$S3_PREFIX/$DB/")" 2>/dev/null \
+        | grep '/MANIFEST.sha256$' | cut -d/ -f1 | sort | tail -n 1)"
+if [ -z "$rel" ]; then
+  log "ОШИБКА: нет полных копий (папок с MANIFEST.sha256) в s3://$S3_BUCKET/$S3_PREFIX/$DB/"; exit 1
 fi
-log "последний дамп: $key (скачиваю — это глубокий тест, трафик считаем допустимым)"
+key="$S3_PREFIX/$DB/$rel"
+log "последняя копия: $key/ (скачиваю — это глубокий тест, трафик считаем допустимым)"
 
-mkdir -p "$TMP/dl"
-rclone $RCLONE_OPTS copy "$(s3path "$key")" "$TMP/dl" >/dev/null 2>&1 || { log "ОШИБКА: не скачать $key"; exit 1; }
-dl="$(ls "$TMP/dl" | head -1)"
-mv "$TMP/dl/$dl" "$TMP/db.dump.zst"
-log "скачано $(wc -c <"$TMP/db.dump.zst") B"
-zstd -t "$TMP/db.dump.zst" >/dev/null 2>&1 || { log "ОШИБКА: zstd -t FAILED"; exit 1; }
-unzstd -c "$TMP/db.dump.zst" | pg_restore -l >/dev/null 2>&1 || { log "ОШИБКА: pg_restore -l FAILED"; exit 1; }
-log "архив валиден (zstd -t + pg_restore -l)"
+DUMP="$TMP/dl"; mkdir -p "$DUMP"
+rclone $RCLONE_OPTS copy "$(s3path "$key/")" "$DUMP" >/dev/null 2>&1 || { log "ОШИБКА: не скачать $key/"; exit 1; }
+log "скачано $(ls "$DUMP" | grep -c .) файлов, $(du -sb "$DUMP" | cut -f1) B"
+(cd "$DUMP" && sha256sum -c -s MANIFEST.sha256) || { log "ОШИБКА: sha256sum -c MANIFEST.sha256 FAILED"; exit 1; }
+for z in "$DUMP"/*.zst; do
+  [ -e "$z" ] || continue
+  zstd -q -t "$z" >/dev/null 2>&1 || { log "ОШИБКА: zstd -t FAILED: ${z##*/}"; exit 1; }
+done
+pg_restore -l "$DUMP" >/dev/null 2>&1 || { log "ОШИБКА: pg_restore -l FAILED"; exit 1; }
+log "копия валидна (sha256 по манифесту + zstd -t каждого файла + pg_restore -l)"
 
 # 2) восстановление в одноразовую БД
 log "восстанавливаю в $SCRATCH на $(psqlD postgres 'select version()' | cut -d, -f1)"
 createdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$SCRATCH"
 # кросс-версионные SET несуществующих GUC — безобидны, провалом не считаем
-unzstd -c "$TMP/db.dump.zst" \
-  | pg_restore -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$SCRATCH" --no-owner --no-privileges \
-      2>"$TMP/restore.err" || true
+pg_restore -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$SCRATCH" -j 2 --no-owner --no-privileges \
+    "$DUMP" 2>"$TMP/restore.err" || true
 nonbenign="$(grep 'pg_restore: error' "$TMP/restore.err" 2>/dev/null \
               | grep -vc 'unrecognized configuration parameter' || true)"
 if [ "${nonbenign:-0}" != "0" ]; then

@@ -20,14 +20,15 @@ services:
       S3_BUCKET: "CHANGE_ME"
       S3_PREFIX: "myapp"
       # Поведение
-      KEEP: "7"                                # копий каждой базы
-      ZSTD_LEVEL: "9"                          # 6=быстро, 9=баланс, 19=плотнее/медленнее
+      KEEP: "7"                                # полных копий (папок) каждой базы
+      ZSTD_LEVEL: "3"                          # pg_dump -Z zstd:N; 3=быстро (дефолт), 9 ≈ −4% размера в 4 раза дольше
+      DUMP_JOBS: "2"                           # pg_dump -j: таблиц параллельно (соединений = N+1)
       INTERVAL: "86400"                        # секунд между прогонами
       EXCLUDE_DBS: "postgres"
       # Проверки целостности
-      VERIFY: "1"                              # zstd -t + pg_restore -l перед загрузкой
+      VERIFY: "1"                              # pg_restore -l + zstd -t каждого файла перед загрузкой
       VERIFY_FULL: "1"                         # 1 = ещё и полное чтение архива (без БД), медленнее
-      VERIFY_REMOTE: "1"                       # сверка размера в S3 после загрузки
+      VERIFY_REMOTE: "1"                       # rclone check: сверка копии в S3 без скачивания
       RESTORE_TEST: "0"                        # 1 = тест восстановления в скретч-БД (нужен CREATEDB)
     # Альтернатива environment: — файл KEY=VALUE (окружение приоритетнее файла).
     # Удобно в swarm, где stack-файл игнорирует env_file:.

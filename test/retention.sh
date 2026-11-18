@@ -1,6 +1,8 @@
 #!/bin/sh
 # Проверка retention: заливаем БОЛЬШЕ копий, чем KEEP, и убеждаемся, что в S3 остались
-# ровно KEEP самых новых, а старые удалены. Гоняем backup.sh с RUN_ONCE=1 и малым KEEP.
+# ровно KEEP самых новых копий-папок, а старые удалены. Гоняем backup.sh с RUN_ONCE=1 и малым KEEP.
+# Дополнительно: копии прежнего формата (одиночный <TS>.dump.zst) и неполная папка без манифеста
+# должны удалиться тоже.
 #
 # Использование: retention.sh <pgXX> [keep=2] [runs=5]   (runs должно быть > keep)
 # Переменные: PGHOST/PGPORT/PGUSER/PGPASSWORD, S3_BUCKET/S3_PREFIX (rclone).
@@ -26,17 +28,22 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 log() { echo "[retention $VER] $*"; }
 
-# все ключи (полные) под префиксом, по возрастанию (старые -> новые)
+# копии под префиксом (папки <TS>/ и одиночные файлы верхнего уровня), по возрастанию
 list_keys() {
-  s3_list "$PREFIX" | while IFS= read -r r; do [ -n "$r" ] && printf '%s\n' "$PREFIX$r"; done
+  rclone lsf "$(s3path "$PREFIX")" 2>/dev/null | grep . | sort \
+    | while IFS= read -r r; do printf '%s\n' "$PREFIX$r"; done
 }
 
 # чистим префикс от прошлых прогонов, чтобы счёт был детерминированным
-del_all() {
-  for k in $(list_keys); do s3_del "$k"; done
-}
+rclone purge "$(s3path "$PREFIX")" >/dev/null 2>&1 || true
 
-del_all
+# «наследие»: копия прежнего формата и неполная папка (упавший прогон) — обе старше любых новых
+LEGACY="${PREFIX}20000101T000000Z.dump.zst"
+PARTIAL="${PREFIX}20000102T000000Z/"
+printf legacy > "$TMP/l"
+rclone copyto "$TMP/l" "$(s3path "$LEGACY")" >/dev/null 2>&1
+rclone copyto "$TMP/l" "$(s3path "${PARTIAL}toc.dat")" >/dev/null 2>&1
+log "подложены: копия старого формата $LEGACY и неполная папка $PARTIAL"
 log "старт: KEEP=$KEEP_R, прогонов=$RUNS, префикс $S3_BUCKET/$PREFIX"
 
 # заливаем RUNS копий, запоминая ключ каждого прогона
@@ -49,7 +56,9 @@ while [ "$i" -le "$RUNS" ]; do
     log "ОШИБКА: прогон $i завершился неудачно:"; sed 's/^/    /' "$TMP/run$i.log"; exit 1
   fi
   k="$(list_keys | tail -n 1)"
-  [ -n "$k" ] || { log "ОШИБКА: прогон $i не залил объект"; exit 1; }
+  case "$k" in */) ;; *) log "ОШИБКА: прогон $i не залил копию-папку (последний ключ: '$k')"; exit 1 ;; esac
+  rclone lsf "$(s3path "${k}MANIFEST.sha256")" >/dev/null 2>&1 \
+    || { log "ОШИБКА: в копии $k нет MANIFEST.sha256"; exit 1; }
   echo "$k" >> "$TMP/keys.txt"
   n="$(list_keys | grep -c .)"
   log "прогон $i: залит $k; сейчас в S3 $n объектов (KEEP=$KEEP_R)"
@@ -81,6 +90,8 @@ fi
 if printf '%s\n' "$left" | grep -qx "$oldest"; then
   log "FAIL: самый старый дамп ($oldest) не удалён"; rc=1
 fi
+if printf '%s\n' "$left" | grep -qxF "$LEGACY"; then log "FAIL: копия старого формата не удалена"; rc=1; fi
+if printf '%s\n' "$left" | grep -qxF "$PARTIAL"; then log "FAIL: неполная папка не удалена"; rc=1; fi
 
 if [ "$rc" = "0" ]; then
   log "OK: залито $RUNS копий, KEEP=$KEEP_R — в S3 остались ровно $KEEP_R новейших, старейшие $((RUNS - KEEP_R)) удалены"

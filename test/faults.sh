@@ -1,8 +1,8 @@
 #!/bin/sh
 # Негативные проверки (fault injection): если pg_dump НЕ смог сделать дамп, backup.sh ОБЯЗАН
-# вернуть ненулевой код и НЕ загружать объект в S3. Ловит классическую ошибку с маскировкой
-# статуса в конвейере `pg_dump | zstd` (в POSIX sh статус конвейера — это статус zstd, поэтому
-# оборванный дамп с валидным оглавлением может пройти verify и уехать в S3 как «успешный»).
+# вернуть ненулевой код и НЕ загружать объект в S3. Сценарии: pg_dump падает сразу и падает,
+# оставив валидный toc.dat + оборванные файлы данных (такой дамп может пройти лёгкий verify и уехать
+# в S3 как «успешный», если код возврата pg_dump где-то потерян).
 #
 # Использование: faults.sh [pgXX=pg18]
 # Переменные: PGHOST/PGPORT/PGUSER/PGPASSWORD, S3_BUCKET/S3_PREFIX (rclone).
@@ -18,7 +18,7 @@ PGPORT="${PGPORT:-5432}"
 
 DB="app"
 PREFIX="test/faults-$VER"
-REF=/tmp/ref.dump
+REF=/tmp/ref.dir
 FAKEBIN=/tmp/fakebin
 FAILED=0
 log() { echo "[faults $VER] $*"; }
@@ -27,20 +27,25 @@ psqlD() { psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$1" -At -c "$2"; }
 count_prefix() { s3_list "$PREFIX/" | grep -c . || true; }
 clean_prefix() { for k in $(s3_list "$PREFIX/"); do s3_del "$PREFIX/$k"; done; }
 
-# --- эталонный (валидный) дамп: нужен, чтобы имитировать «оборвалось на середине» ---
+# --- эталонный (валидный) дамп в directory-формате: из него собираем «оборванный» ---
 createdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" faults_ref 2>/dev/null || true
-psqlD faults_ref "create table t as select g, repeat(md5(g::text),50) v from generate_series(1,20000) g" >/dev/null
-pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -Fc -d faults_ref > "$REF"
-log "эталонный дамп: $(wc -c <"$REF") B"
+psqlD faults_ref "create table if not exists t as select g, repeat(md5(g::text),50) v from generate_series(1,20000) g" >/dev/null
+rm -rf "$REF"; pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -Fd -Z zstd:3 -d faults_ref -f "$REF"
+log "эталонный дамп: $(du -sb "$REF" | cut -f1) B, файлов $(ls "$REF" | grep -c .)"
 
 # --- подставной pg_dump: падает, отдав (или не отдав) оглавление и часть данных ---
 mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/pg_dump" <<'EOS'
 #!/bin/sh
 case "$*" in *--version*) echo "pg_dump (PostgreSQL) 18.6"; exit 0 ;; esac
+# -Fd: пишет в папку из аргумента -f
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "-f" ] && out="$a"; prev="$a"; done
 case "${FAKE_MODE:-mid}" in
-  mid)       head -c $(( $(wc -c < /tmp/ref.dump) * 55 / 100 )) /tmp/ref.dump ;;
-  immediate) : ;;    # падает, не отдав ничего
+  mid)       # оглавление целое, файл данных оборван на середине — как при разрыве соединения
+             mkdir -p "$out" && cp /tmp/ref.dir/toc.dat "$out/" \
+             && for f in /tmp/ref.dir/*.dat.zst; do head -c $(( $(wc -c < "$f") * 55 / 100 )) "$f" > "$out/${f##*/}"; done ;;
+  immediate) : ;;    # падает, не создав ничего
 esac
 echo "pg_dump: error: simulated connection failure" >&2
 exit 1

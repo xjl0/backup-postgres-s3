@@ -6,3 +6,5 @@ Makefile
 stack.env
 .env
 test
+*.dump
+*.dump.zst

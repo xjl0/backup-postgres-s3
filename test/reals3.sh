@@ -77,7 +77,7 @@ PGHOST="$PGHOST" S3_PREFIX="$S3_PREFIX" RUN_ONCE=1 INTERVAL=1 KEEP="${KEEP:-3}" 
   sh /usr/local/bin/backup.sh > /tmp/reals3-backup.log 2>&1
 rc=$?
 sed 's/^/        /' /tmp/reals3-backup.log
-if [ "$rc" = "0" ] && grep -q 'размер в S3 сверен' /tmp/reals3-backup.log; then
+if [ "$rc" = "0" ] && grep -q 'копия в S3 сверена' /tmp/reals3-backup.log; then
   ok "backup.sh: выгрузка и проверка объекта без скачивания прошли"
 else
   bad "backup.sh завершился с кодом $rc или объект не сверен"

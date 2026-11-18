@@ -93,7 +93,7 @@ services:
       KEEP: "3"
       KEEP_CHECK: "2"        # retention-проверка: сколько копий оставлять (RUNS > KEEP_CHECK)
       KEEP_RUNS: "5"         # retention-проверка: сколько раз залить
-      ZSTD_LEVEL: "6"
+      ZSTD_LEVEL: "3"
       INTERVAL: "1"
       RUN_ONCE: "1"
       WAIT_DB_TIMEOUT: "180"

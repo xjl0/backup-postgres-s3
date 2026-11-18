@@ -3,7 +3,7 @@
 ## Что это
 
 `pg-s3-backup` — самостоятельный репозиторий (без коммитов, история ещё не начата).
-Один Docker-образ, который циклично делает **логический бэкап всех баз PostgreSQL → zstd → S3**,
+Один Docker-образ, который циклично делает **логический бэкап всех баз PostgreSQL → pg_dump `-Fd` (zstd по файлу на таблицу) → S3 папкой**,
 с проверкой целостности и ретеншном. Подключается к любому стеку только образом + переменными окружения.
 
 Вся логика — в одном скрипте `backup.sh` (POSIX `sh`). Остальное — обвязка для сборки/запуска.
@@ -12,7 +12,7 @@
 
 | Файл | Роль |
 |---|---|
-| `backup.sh` | **Вся логика.** Цикл `while true`: перечислить базы → `pg_dump -Fc -Z0` → внешний `zstd` → `verify` → `rclone copy` → `retain` → `sleep INTERVAL` |
+| `backup.sh` | **Вся логика.** Цикл `while true`: перечислить базы → `pg_dump -Fd -j -Z zstd:N` → `verify` → `rclone copy` папки → `rclone check` → `MANIFEST.sha256` → `retain` → `sleep INTERVAL` |
 | `Dockerfile` | `postgres:${PG_MAJOR}-alpine` + `rclone` + `zstd` + `curl`; `USER postgres`; ENTRYPOINT — скрипт. `ARG PG_MAJOR=18` |
 | `docker-compose.example.yml` | Пример подключения (только `image` + `environment`), сервис в одной сети с БД |
 | `stack.env.example` | Шаблон env-файла (`KEY=VALUE`); `cp stack.env.example stack.env` (последний в `.gitignore`) |
@@ -31,29 +31,33 @@
 
 0. `load_env_file`: читает переменные из `ENV_FILE` (по умолчанию `/etc/pg-backup/env`), **не** переопределяя
    уже заданные в окружении (окружение приоритетнее файла). Поддержка обоих способов — см. «Соглашения».
-1. `set -u`, обязательные переменные через `${VAR:?}`; ставит `rclone`/`zstd` через `apk`, если их нет.
+1. `set -u`, обязательные переменные через `${VAR:?}`; ставит `rclone`/`zstd` через `apk` (с повторами), если их нет; клиент pg_dump < 16 → FATAL (нет `-Z zstd`).
 2. `detect_env()`: читает `server_version_num`, права роли (`rolsuper`/`rolbypassrls`/`rolcreatedb`),
    членство в `pg_read_all_data`.
 3. Ждёт `pg_isready`. Если **сервер новее клиента** `pg_dump` — пропускает прогон с FATAL (клиент обязан быть `>=` сервера).
 4. `_globals` (роли/привилегии, `pg_dumpall --globals-only --no-role-passwords`) → `S3_PREFIX/_globals/<ts>.sql.zst`.
 5. По каждой базе из `pg_database` (кроме `EXCLUDE_DBS`, шаблонов, `datallowconn=false`):
    - предпроверка `CONNECT`; предупреждение о RLS-таблицах без `BYPASSRLS`;
-   - `pg_dump -Fc -Z0` (cross-version → `--quote-all-identifiers`) `| zstd -<ZSTD_LEVEL>` в файл;
-   - `verify_archive()`: `zstd -t` + `unzstd | pg_restore -l`, при `VERIFY_FULL=1` ещё `pg_restore -f /dev/null`;
-   - при `RESTORE_TEST=1` — восстановление в скретч-БД `restore_test_*` и `dropdb` (нужен `CREATEDB`/суперюзер);
-   - `rclone copy` файла `<UTC>.dump.zst` в `S3_PREFIX/<db>/`, при `VERIFY_REMOTE=1` сверка размера (`rclone ls`);
-   - `retain()` — оставляет `KEEP` последних объектов префикса, лишние удаляет.
+   - `pg_dump -Fd -j DUMP_JOBS -Z zstd:ZSTD_LEVEL` (cross-version → `--quote-all-identifiers`) в папку
+     `WORKDIR/<db>/<UTC>/`: `toc.dat` + самостоятельный `<oid>.dat.zst` на таблицу;
+   - `verify_archive()`: `pg_restore -l` + `zstd -t` каждого файла, при `VERIFY_FULL=1` ещё `pg_restore -f /dev/null`;
+   - при `RESTORE_TEST=1` — восстановление папки в скретч-БД `restore_test_*` и `dropdb` (нужен `CREATEDB`/суперюзер);
+   - `MANIFEST.sha256` локально → `rclone copy` папки (без манифеста) в `S3_PREFIX/<db>/<UTC>/` →
+     при `VERIFY_REMOTE=1` `rclone check` (список/размеры/MD5 без скачивания) → манифест последним;
+     при провале — `rclone purge` неполной папки;
+   - `retain()` — копии = папки с манифестом (+ одиночные файлы прежнего формата); оставляет `KEEP`
+     новейших, остальные удаляет (`purge`/`deletefile`); папки без манифеста (кроме текущего TS) удаляет.
 6. Любой сбой помечает прогон `failed=1`; дамп при провале проверок **не** загружается.
 
 ## Соглашения и грабли
 
 - Язык комментариев/логов/доков — **русский**; сообщения скрипта в stdout → `docker logs`.
-- **S3 — только через `rclone`**, минимум сущностей: `rclone ls` (список/размер), `rclone copy`
-  (загрузка/скачивание), `rclone deletefile` (retention). Потоки загрузки — всегда 4, остальное по
+- **S3 — только через `rclone`**, минимум сущностей: `rclone lsf` (список), `rclone copy`/`copyto`
+  (загрузка/скачивание), `rclone check` (сверка без скачивания), `rclone purge`/`deletefile` (retention). Потоки загрузки — всегда 4, остальное по
   умолчанию rclone. Подключение — из переменных окружения (`S3_ENDPOINT`/`S3_REGION`/ключи), файла
   конфигурации нет. Бакет уже существует — скрипт его НЕ создаёт.
 - **Данные из S3 по умолчанию НЕ выкачиваются**: `VERIFY_FULL=1` (локально) + `VERIFY_REMOTE=1`
-  (размер через `rclone ls`). Полное скачивание — только `VERIFY_DOWNLOAD=1`.
+  (`rclone check` по метаданным). Полное скачивание — только `VERIFY_DOWNLOAD=1`.
 - Надёжность загрузки — два уровня: **наши 3 попытки** (`rclone copy` заново, пауза 10 с) и
   **внутренние повторы rclone** (`--retries 5`, `--low-level-retries 25`, `--timeout 15m`).
   Плюс сторожевой таймаут попытки (минимум 15 мин, для крупных дампов ~размер/300 КБ/с).
@@ -62,13 +66,14 @@
 - Переменные берутся из окружения **и** из `ENV_FILE` (`KEY=VALUE`, по умолчанию `/etc/pg-backup/env`);
   заданные в окружении имеют приоритет. Новую переменную документируй в `README.md`.
 - Правки — в `backup.sh`; помни, что это POSIX `sh`, а не bash.
-- Сжатие — **внешним `zstd` по всему архиву**, а не `-Z zstd` внутри `pg_dump` (встроенное жмёт по сегментам и хуже).
-- `pg_restore` не читает `.zst` напрямую — всегда `unzstd -c file | pg_restore`.
-- **Статус конвейера в POSIX `sh` — это статус последней команды** (`pg_dump | zstd` → статус `zstd`),
-  поэтому код возврата `pg_dump`/`pg_dumpall` пишется в отдельный файл (иначе оборванный дамп уедет
-  в S3 как «успешный»). Это покрыто `test/faults.sh` — не сломай.
-- Проверки уровня `VERIFY` (`zstd -t` + `pg_restore -l`) НЕ ловят обрыв внутри данных: оглавление
-  валидно. Ловит только `VERIFY_FULL=1` (`pg_restore -f /dev/null`).
+- Сжатие — **встроенный zstd pg_dump** (`-Fd -Z zstd:N`), по файлу на таблицу: каждый файл самостоятелен,
+  `pg_restore` читает папку напрямую. Сжатие однопоточное (pg_dump не поддерживает `workers`), поэтому
+  дефолт `ZSTD_LEVEL=3` (замер на 6,7 ГБ: 3 → 17 с, 9 → 72 с, 15 → 586 с при разнице размера ≤5%).
+- `MANIFEST.sha256` загружается **последним** и служит маркером полной копии — не меняй порядок.
+- Код возврата `pg_dump` теперь прямой (конвейера нет); у `pg_dumpall | zstd` (globals) он по-прежнему
+  пишется в отдельный файл. Падение pg_dump → нет загрузки — покрыто `test/faults.sh`, не сломай.
+- Проверки уровня `VERIFY` (`pg_restore -l` + `zstd -t`) НЕ ловят обрыв на границе zstd-фрейма:
+  надёжно ловит `VERIFY_FULL=1` (`pg_restore -f /dev/null`) и код возврата pg_dump.
 - Кросс-версионные `SET <guc>`-ошибки при restore считаются безобидными (см. `nonbenign`).
 - Меняя поведение/переменные — синхронизируй таблицу в `README.md` и комментарии в `docker-compose.example.yml`.
 - Репозиторий ещё без коммитов; `.idea` вычищена из индекса и добавлена в `.gitignore`.
